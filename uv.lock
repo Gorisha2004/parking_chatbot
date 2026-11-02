@@ -886,6 +886,14 @@ wheels = [
 ]
 
 [[package]]
+name = "en-core-web-lg"
+version = "3.8.0"
+source = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl" }
+wheels = [
+    { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl", hash = "sha256:293e9547a655b25499198ab15a525b05b9407a75f10255e405e8c3854329ab63" },
+]
+
+[[package]]
 name = "filelock"
 version = "4.2.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2645,6 +2653,7 @@ name = "parking-chatbot"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "en-core-web-lg" },
     { name = "langchain" },
     { name = "langchain-chroma" },
     { name = "langchain-community" },
@@ -2664,6 +2673,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "en-core-web-lg", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl" },
     { name = "langchain", specifier = ">=1.4.7" },
     { name = "langchain-chroma", specifier = ">=1.1.0" },
     { name = "langchain-community", specifier = ">=0.4.2" },

@@ -1,0 +1,51 @@
+# CI for the parking chatbot: installs deps with uv and runs the pytest suite.
+#
+# No lint/type-check jobs here: the project doesn't use ruff or mypy, so adding
+# them to CI would just fail on tools nobody runs locally. Add jobs for them in
+# this file if/when they're adopted.
+
+# Run once per merge request, and once per plain branch push - not twice for
+# the same commit (which is what happens by default once an MR exists for it).
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+stages:
+  - test
+
+variables:
+  # uv's own download/build cache. Pointed inside the project dir because
+  # GitLab can only cache paths under CI_PROJECT_DIR.
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.cache/uv"
+  # Every test mocks the LLM, embeddings, vector store and network - nothing
+  # here ever makes a real call. These are placeholders only, never read a
+  # real .env or secret. config.py's other settings (MAX_ADVANCE_DAYS etc.)
+  # already have working defaults and don't need a variable here.
+  DIAL_ENDPOINT: "https://dummy.invalid"
+  DIAL_API_KEY: "dummy-key"
+  DIAL_API_VERSION: "2024-01-01"
+  CHAT_MODEL: "dummy-chat-model"
+  EMBEDDING_MODEL: "dummy-embedding-model"
+
+pytest:
+  stage: test
+  image: python:3.11-slim  # matches .python-version / requires-python in pyproject.toml
+  before_script:
+    - pip install --quiet uv
+  script:
+    - uv sync
+    - uv run pytest --junitxml=report.xml
+  cache:
+    # One cache per lockfile version: hits on every run until a dependency
+    # changes, then rebuilds once and starts hitting again.
+    key:
+      files:
+        - uv.lock
+    paths:
+      - .venv/
+      - .cache/uv
+  artifacts:
+    when: always  # keep the report even if a test fails, so GitLab can show what broke
+    reports:
+      junit: report.xml
