@@ -46,6 +46,19 @@ _REFUSE = re.compile(r"\b(refuse[ds]?|reject(ed)?|deny|denied|no)\b", re.IGNOREC
 _BOOKING_ID_SEARCH = re.compile(rf"\b{BOOKING_ID_PREFIX}-[{ID_ALPHABET}]{{{BOOKING_ID_LENGTH}}}\b", re.IGNORECASE)
 _BOOKING_ID_FULLMATCH = re.compile(rf"^{BOOKING_ID_PREFIX}-[{ID_ALPHABET}]{{{BOOKING_ID_LENGTH}}}$")
 
+# "is it approved?", "has PK-X been refused yet" etc. - past-participle forms like
+# "approved"/"refused" match _APPROVE/_REFUSE below, so a plain status QUESTION would
+# otherwise be misread as a decision COMMAND. Checked first so a question never
+# creates or confirms a proposal; it's left for the agent, which calls
+# get_booking_status and answers from the real database state instead.
+_QUESTION = re.compile(
+    r"^\s*(is|was|are|were|has|have|had|does|did|do|can|could|would|will|what|how)\b|\?\s*$", re.IGNORECASE
+)
+
+
+def _looks_like_a_question(message: str) -> bool:
+    return bool(_QUESTION.search(message))
+
 _INTERPRET_PROMPT = """An administrator was asked to approve or refuse a parking reservation.
 Their reply did not contain a clear "approve" or "refuse" instruction, so decide only between
 these two options:
@@ -208,6 +221,12 @@ _proposals: dict[str, _Proposal] = {}
 # (called from the CLI's own input loop) ever writes this - record_decision reads it,
 # an LLM tool call can never supply or overwrite it.
 _latest_admin_message: dict[str, str] = {}
+# The booking ID(s) currently "in view" for this conversation, keyed by thread_id -
+# set whenever list_pending_requests, get_request_details or get_booking_status runs,
+# or a proposal is created by naming an ID explicitly. Lets "approve it" resolve
+# without repeating the ID: if there's exactly one, it means that one; if there are
+# several, the administrator is asked which.
+_context_bookings: dict[str, list[str]] = {}
 
 
 def record_admin_message(thread_id: str, message: str) -> None:
@@ -215,11 +234,37 @@ def record_admin_message(thread_id: str, message: str) -> None:
     _latest_admin_message[thread_id] = message
 
 
+def set_context_bookings(thread_id: str, booking_ids: list[str]) -> None:
+    """Record which booking(s) are currently in view for this conversation."""
+    _context_bookings[thread_id] = booking_ids
+
+
+def _propose(thread_id: str, booking_id: str, decided: InterpretedReply) -> ProposalOutcome:
+    """Create (or replace) a proposal for an explicitly-identified booking."""
+    booking = admin_db.get_pending_request(booking_id)
+    if booking is None:
+        return ProposalOutcome(
+            action="error",
+            message=f"No pending booking found with ID {booking_id} "
+            "(it may not exist, already be decided, or have expired).",
+        )
+    _proposals[thread_id] = _Proposal(booking_id, decided.decision, decided.reason)
+    set_context_bookings(thread_id, [booking_id])
+    return ProposalOutcome(action="proposed", booking=booking, decision=decided.decision, reason=decided.reason)
+
+
 def update_proposal(thread_id: str, message: str) -> ProposalOutcome:
     """Run the administrator's raw message through the deterministic confirmation
     flow. Returns action="none" if nothing decision-related was found, so the caller
     can fall back to the agent (for browsing and open-ended conversation).
     """
+    if _looks_like_a_question(message):
+        # "is PK-X approved?" contains "approved", which matches _APPROVE - but this
+        # is a status question, not a decision. Always defer to the agent, which
+        # calls get_booking_status and answers from the real database state. A
+        # proposal already waiting for yes/no is left untouched, not auto-confirmed.
+        return ProposalOutcome(action="none")
+
     match = _BOOKING_ID_SEARCH.search(message)
     if match:
         booking_id = match.group(0).upper()
@@ -236,20 +281,33 @@ def update_proposal(thread_id: str, message: str) -> ProposalOutcome:
                 message=f"Couldn't tell whether you want to approve or refuse {booking_id}. "
                 "Please say APPROVE or REFUSE clearly.",
             )
-
-        booking = admin_db.get_pending_request(booking_id)
-        if booking is None:
-            return ProposalOutcome(
-                action="error",
-                message=f"No pending booking found with ID {booking_id} "
-                "(it may not exist, already be decided, or have expired).",
-            )
-        _proposals[thread_id] = _Proposal(booking_id, decided.decision, decided.reason)
-        return ProposalOutcome(action="proposed", booking=booking, decision=decided.decision, reason=decided.reason)
+        return _propose(thread_id, booking_id, decided)
 
     proposal = _proposals.get(thread_id)
     if proposal is None:
-        return ProposalOutcome(action="none")
+        # No explicit ID and nothing proposed yet - "approve it" / "refuse, dates
+        # clash": a decision word with no ID resolves against whichever booking(s)
+        # are currently in view, instead of being rejected for not naming an ID.
+        if not (_APPROVE.search(message) or _REFUSE.search(message)):
+            return ProposalOutcome(action="none")  # plain browsing or chit-chat
+
+        decided = _check_keywords(message)
+        if decided is None:
+            return ProposalOutcome(
+                action="unclear",
+                message="Couldn't tell whether you want to approve or refuse. Please say APPROVE or REFUSE clearly.",
+            )
+
+        in_view = _context_bookings.get(thread_id, [])
+        if not in_view:
+            return ProposalOutcome(action="unclear", message="Which booking do you mean? Please give a booking ID.")
+        if len(in_view) > 1:
+            return ProposalOutcome(
+                action="unclear",
+                message=f"Several bookings are in view ({', '.join(in_view)}) - which one do you mean? "
+                "Please give a booking ID.",
+            )
+        return _propose(thread_id, in_view[0], decided)
 
     is_confirm = bool(_APPROVE.search(message)) and not _NEGATED_APPROVAL.search(message) and not _REFUSE.search(message)
     is_cancel = bool(_REFUSE.search(message)) and not _APPROVE.search(message)
@@ -286,9 +344,11 @@ def _thread_id(config: RunnableConfig) -> str:
 
 
 @tool
-def list_pending_requests() -> str:
+def list_pending_requests(config: RunnableConfig) -> str:
     """List every booking currently awaiting a decision, with a short summary of each."""
+    tid = _thread_id(config)
     pending = admin_db.list_pending_bookings()
+    set_context_bookings(tid, [r.booking_id for r in pending])
     return json.dumps(
         {"count": len(pending), "pending": [{"booking_id": r.booking_id, "summary": render_request(r)} for r in pending]}
     )
@@ -298,7 +358,8 @@ def list_pending_requests() -> str:
 def get_request_details(config: RunnableConfig, booking_id: str) -> str:
     """Show the full details of one pending booking (booker, period, every vehicle) so
     it can be read back to the administrator. Call this before discussing or deciding
-    on any specific booking."""
+    on any specific PENDING booking. For a booking that might already be decided or
+    expired, call get_booking_status instead."""
     tid = _thread_id(config)
     booking_id = booking_id.strip().upper()
     if not _BOOKING_ID_FULLMATCH.match(booking_id):
@@ -311,6 +372,7 @@ def get_request_details(config: RunnableConfig, booking_id: str) -> str:
         )
 
     _detail_shown.setdefault(tid, set()).add(booking_id)
+    set_context_bookings(tid, [booking_id])
     return json.dumps(
         {
             "details": request.model_dump(mode="json"),
@@ -322,19 +384,43 @@ def get_request_details(config: RunnableConfig, booking_id: str) -> str:
 
 
 @tool
+def get_booking_status(config: RunnableConfig, booking_id: str) -> str:
+    """Look up the REAL, current status of any booking - pending, approved, refused
+    or expired - straight from the database. ALWAYS call this when the administrator
+    asks about a booking's status, or says they already decided on one: never answer
+    such a question from conversation memory, and never ask them to repeat a decision
+    without checking here first. Returns status, decided_at, decision_reason and the
+    booking's details (you may see everything, there is no privacy restriction here)."""
+    tid = _thread_id(config)
+    booking_id = booking_id.strip().upper()
+    if not _BOOKING_ID_FULLMATCH.match(booking_id):
+        return json.dumps({"error": f"'{booking_id}' is not a valid booking ID. It should look like PK-XXXXXX."})
+
+    info = admin_db.get_booking_for_admin(booking_id)
+    if info is None:
+        return json.dumps({"error": f"No booking found with ID {booking_id}."})
+
+    if info["status"] == "pending":
+        _detail_shown.setdefault(tid, set()).add(booking_id)
+        set_context_bookings(tid, [booking_id])
+    return json.dumps(info)
+
+
+@tool
 def record_decision(config: RunnableConfig, booking_id: str, decision: Literal["approved", "refused"], reason: str | None = None) -> str:
     """Record the administrator's decision on a booking. Only call this after
-    get_request_details has been shown for this exact booking_id in this conversation,
-    and the administrator has explicitly confirmed with a clear APPROVE or REFUSE in
-    their own latest message - never guess or infer a decision from earlier context.
-    This independently re-checks the administrator's actual latest message before
-    writing anything, and refuses if that message doesn't clearly support `decision`."""
+    get_request_details or get_booking_status has been shown for this exact
+    booking_id in this conversation, and the administrator has explicitly confirmed
+    with a clear APPROVE or REFUSE in their own latest message - never guess or infer
+    a decision from earlier context. This independently re-checks the administrator's
+    actual latest message before writing anything, and refuses if that message
+    doesn't clearly support `decision`."""
     tid = _thread_id(config)
     booking_id = booking_id.strip().upper()
     if booking_id not in _detail_shown.get(tid, set()):
         return json.dumps(
-            {"error": f"Call get_request_details for {booking_id} first, and get the administrator's "
-             "explicit confirmation, before recording a decision."}
+            {"error": f"Call get_request_details or get_booking_status for {booking_id} first, and get the "
+             "administrator's explicit confirmation, before recording a decision."}
         )
 
     admin_message = _latest_admin_message.get(tid)
@@ -350,39 +436,54 @@ def record_decision(config: RunnableConfig, booking_id: str, decision: Literal["
             {"error": f"Your latest message reads as {error.actual}, not {decision} as requested. "
              "Nothing was recorded; please confirm clearly."}
         )
-    except admin_db.AdminBookingError as error:
+    except admin_db.UnknownBookingError as error:
+        return json.dumps({"error": str(error)})
+    except admin_db.ExpiredBookingError as error:
+        return json.dumps({"error": str(error)})
+    except admin_db.AlreadyDecidedError as error:
         return json.dumps({"error": str(error)})
 
     _detail_shown.get(tid, set()).discard(booking_id)
     return json.dumps({"booking_id": result.booking_id, "decision": result.decision, "reason": result.reason})
 
 
-ADMIN_TOOLS = [list_pending_requests, get_request_details, record_decision]
+ADMIN_TOOLS = [list_pending_requests, get_request_details, get_booking_status, record_decision]
 
 ADMIN_AGENT_SYSTEM_PROMPT = """You are the administrator's assistant for CityPark Central parking reservations.
 
-Your job is to help the administrator review bookings awaiting approval. You are
-talking to the administrator, not a customer - there is no privacy restriction on the
-booking details shown here.
+Your job is to help the administrator review bookings and find out their real
+status. You are talking to the administrator, not a customer - there is no privacy
+restriction on the booking details shown here.
 
 Rules:
 1. To see what's waiting, call list_pending_requests.
-2. Before discussing or deciding on a specific booking, call get_request_details for
-   its booking ID so the administrator sees the full details.
-3. Most approve/refuse decisions are handled automatically before you are even asked -
-   if the administrator's message already names a booking ID with a clear decision,
-   or is a plain yes/no replying to a decision that was just proposed, the system has
-   already acted on it and you will not be asked to do anything further for it.
-4. If the administrator's intent isn't clear enough for that, ask them to state it
-   plainly: "APPROVE <booking ID>" or "REFUSE <booking ID>", optionally with a reason.
-   Do not call record_decision based on a guess, an earlier message, or anything other
-   than what the administrator just typed.
-5. Only call record_decision as a last resort, and only right after the
+2. Before discussing or deciding on a specific PENDING booking, call
+   get_request_details for its booking ID so the administrator sees the full details.
+3. Whenever the administrator asks about a booking's status, or says they already
+   approved/refused/decided on something, you MUST call get_booking_status and
+   answer strictly from its result - never from what was said earlier in this
+   conversation. If it reports the booking is already approved, refused or expired,
+   say so plainly (when it was decided, and the reason if refused) and STOP - do not
+   ask the administrator to repeat the decision, and never say a decision "hasn't
+   been recorded" or is "still pending" without having just checked.
+4. Most approve/refuse decisions are handled automatically before you are even asked:
+   a message naming a booking with a clear decision ("approve PK-X", "refuse PK-X,
+   no space"), "approve it" / "refuse it" when exactly one booking is currently in
+   view, or a plain yes/no confirming a decision that was just proposed, are all
+   acted on by the system before you see them. You are only asked to help when that
+   didn't resolve things - for example several bookings are in view and it's unclear
+   which one "it" means, or the wording was genuinely ambiguous.
+5. If it's unclear which booking is meant, or whether the administrator means
+   approve or refuse, ask them to say which booking (or its ID) and APPROVE or REFUSE
+   plainly. Never guess, and never call record_decision based on a guess, an earlier
+   message, or anything other than what the administrator just typed.
+6. Only call record_decision as a last resort, and only right after the
    administrator's own explicit APPROVE/REFUSE for that exact booking ID. It
    independently re-checks their actual latest message and refuses to write if
-   anything is unclear or contradictory - if it returns an error, relay it plainly and
-   ask the administrator to restate their decision.
-6. Never claim a booking was approved or refused unless a tool actually reports that
+   anything is unclear or contradictory - if it returns an error (unknown booking,
+   already decided, expired, ambiguous, or a mismatch), relay that specific reason
+   plainly and ask the administrator to restate their decision.
+7. Never claim a booking was approved or refused unless a tool actually reports that
    outcome. Never invent booking details.
 """
 

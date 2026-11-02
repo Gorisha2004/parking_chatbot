@@ -123,6 +123,42 @@ def test_get_booking_does_not_expire_a_booking_still_within_the_window(sql_db, m
     assert admin.get_booking("PK-AAAAAA")["status"] == "pending"
 
 
+# --- get_booking_for_admin --------------------------------------------------------------------------
+
+
+def test_get_booking_for_admin_returns_none_for_an_unknown_id(sql_db):
+    assert admin.get_booking_for_admin("PK-NOPE00") is None
+
+
+@pytest.mark.parametrize("status", ["pending", "approved", "refused"])
+def test_get_booking_for_admin_returns_full_details_at_any_status(sql_db, status):
+    _insert_booking("PK-AAAAAA", status=status, vehicles=(("AAA111", "car"),))
+
+    result = admin.get_booking_for_admin("PK-AAAAAA")
+
+    assert result["status"] == status
+    assert (result["first_name"], result["last_name"]) == ("Anna", "Smith")
+    assert result["vehicles"] == [{"pass_id": "PK-AAAAAA-01", "car_number": "AAA111", "vehicle_type": "car"}]
+
+
+def test_get_booking_for_admin_reports_an_expired_booking(sql_db, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_REQUEST_EXPIRY_MINUTES", 60)
+    overdue = datetime.now(timezone.utc) - timedelta(minutes=61)
+    _insert_booking("PK-AAAAAA", status="pending", created_at=overdue)
+
+    assert admin.get_booking_for_admin("PK-AAAAAA")["status"] == "expired"
+
+
+def test_get_booking_for_admin_includes_decided_at_and_reason(sql_db):
+    _insert_booking("PK-AAAAAA")
+    admin.record_decision("PK-AAAAAA", "refused", "no space")
+
+    result = admin.get_booking_for_admin("PK-AAAAAA")
+
+    assert result["decision_reason"] == "no space"
+    assert result["decided_at"] is not None
+
+
 # --- record_decision --------------------------------------------------------------------------------
 
 
@@ -158,14 +194,28 @@ def test_record_decision_twice_raises_and_keeps_the_first_decision(sql_db):
     assert admin.get_booking("PK-AAAAAA")["decision_reason"] == "first"
 
 
-def test_record_decision_on_an_expired_booking_raises_already_decided(sql_db, monkeypatch):
+def test_record_decision_on_an_expired_booking_raises_expired_not_already_decided(sql_db, monkeypatch):
+    """Expired and already-decided are distinct: nobody actually decided this one."""
     monkeypatch.setattr(config, "ADMIN_REQUEST_EXPIRY_MINUTES", 60)
     overdue = datetime.now(timezone.utc) - timedelta(minutes=61)
     _insert_booking("PK-AAAAAA", status="pending", created_at=overdue)
 
-    with pytest.raises(admin.AlreadyDecidedError) as error:
+    with pytest.raises(admin.ExpiredBookingError) as error:
         admin.record_decision("PK-AAAAAA", "approved", None)
-    assert error.value.status == "expired"
+    assert error.value.booking_id == "PK-AAAAAA"
+
+
+def test_already_decided_error_carries_the_existing_decision_and_when(sql_db):
+    _insert_booking("PK-AAAAAA")
+    admin.record_decision("PK-AAAAAA", "approved", "looks fine")
+
+    with pytest.raises(admin.AlreadyDecidedError) as error:
+        admin.record_decision("PK-AAAAAA", "refused", "changed my mind")
+
+    assert error.value.status == "approved"
+    assert error.value.decision_reason == "looks fine"
+    assert error.value.decided_at is not None
+    assert "approved" in str(error.value) and "looks fine" in str(error.value)
 
 
 def test_two_simultaneous_decisions_on_the_same_booking_cannot_both_win(sql_db):

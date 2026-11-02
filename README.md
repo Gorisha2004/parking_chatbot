@@ -1,6 +1,6 @@
 # CityPark Central: Stage 2 - Human-in-the-Loop Admin Approval
 
-This document covers **Stage 2 only**: the human-in-the-loop part of the CityPark Central parking chatbot. For Stage 1 (the chatbot itself - RAG, reservation dialogue, guardrails, evaluation), see [`docs/README_stage1_backup.md`](docs/README_stage1_backup.md).
+This document covers **Stage 2 only**: the human-in-the-loop part of the CityPark Central parking chatbot. 
 
 ## Contents
 
@@ -77,27 +77,40 @@ A booking's `status` column moves through exactly these values:
 
 ## The admin agent
 
-`admin/agent.py` is a second LangChain tool-calling agent (`create_agent`, the same way the chatbot's agent is built), with its own system prompt and three tools:
+`admin/agent.py` is a second LangChain tool-calling agent (`create_agent`, the same way the chatbot's agent is built), with its own system prompt and four tools:
 
 | Tool | Purpose |
 |---|---|
 | `list_pending_requests` | List every booking currently awaiting a decision, with a short summary |
-| `get_request_details(booking_id)` | Show one booking's full details (booker, period, every vehicle) |
+| `get_request_details(booking_id)` | Show one *pending* booking's full details (booker, period, every vehicle) |
+| `get_booking_status(booking_id)` | The REAL, current status of **any** booking - pending, approved, refused or expired - straight from the database, with `decided_at`, `decision_reason` and full details. Always used for status questions; never answered from memory. |
 | `record_decision(booking_id, decision, reason)` | Record a decision - a defense-in-depth fallback, see below |
 
 **The confirmation step is deterministic code, not the LLM.** Before the agent is even invoked, `admin_chat()` runs the administrator's raw message through `update_proposal()`:
 
+- **A status question is never a decision.** "is PK-X approved?", "has PK-X been refused yet?" contain the words "approved"/"refused", which also match the decision keywords - a check for question phrasing (leading "is/was/has/...", or a trailing "?") catches these first and always defers to the agent (which calls `get_booking_status`), so a question can never create, confirm, or silently complete a decision. A proposal already waiting for yes/no is left untouched if the administrator asks an unrelated question in between.
 - A message naming a booking ID with a clear decision ("approve PK-X", "refuse PK-X, no space") creates a *proposal* and shows the full booking details, asking for an explicit yes/confirm or no/cancel - **nothing is written yet**.
-- A bare yes/confirm, with a proposal pending, writes exactly that stored proposal.
+- **"Approve it" / "refuse, dates clash"** (a decision with no booking ID) resolves against whatever booking(s) are currently "in view" for this conversation - set by the last `list_pending_requests`, `get_request_details` or `get_booking_status` call, or by naming an ID explicitly. Exactly one in view → that one; none → asked for an ID; more than one → asked which.
+- A bare yes/confirm, with a proposal pending, writes exactly that stored proposal (not a fresh reading of the word "yes" itself, so confirming a stored *refusal* can't be misread as an approval).
 - A bare no/cancel clears it.
 - Naming a different booking ID or decision replaces whatever was pending.
-- Anything ambiguous or negated ("PK-X, not sure", "don't approve PK-X") is left as-is and the administrator is asked to state it plainly - **it is never treated as an approval**.
-- Only a message with no booking ID and no proposal pending (browsing, open-ended conversation) reaches the LLM agent at all.
+- Anything ambiguous or negated ("PK-X, not sure", "don't approve PK-X", "maybe") is left as-is and the administrator is asked to state it plainly - **it is never treated as an approval**.
+- Only a message with no booking ID, no usable context, and no proposal pending (browsing, open-ended conversation) reaches the LLM agent at all.
+
+**Status questions and "already decided" never come from memory.** The system prompt requires the agent to call `get_booking_status` for any status question, or whenever the administrator says they already decided something, and answer strictly from its result - stating plainly if a booking is already approved, refused or expired (with when, and the reason if refused) and stopping there, rather than asking the administrator to repeat a decision based on what the conversation *seemed* to say earlier. This was a real bug: the agent had told an administrator that an already-decided booking was "still pending" and that "the system has not recorded the approval yet," purely from stale conversation context.
+
+**Distinct, specific errors.** `record_decision` and the REST API's decision endpoint share one write path (`interpret_and_apply`/`apply_decision`) and report five *distinct* failure reasons, each relayed to the administrator in plain words: unknown booking ID, already decided (which decision, and when - `AlreadyDecidedError` now carries `decided_at`/`decision_reason`), expired (a separate `ExpiredBookingError` - nobody decided, as opposed to someone already having decided), an ambiguous message, and a mismatch between the claimed decision and what the administrator's real message says.
 
 **Safety design:**
 - The `record_decision` tool's schema has **no `admin_message` argument** - the LLM cannot supply or forge the text a decision gets checked against. The tool reads the administrator's actual latest input from a plain per-conversation store that only the CLI's own input loop writes to (`record_admin_message`), independently re-derives the decision from it (`interpret_reply`), and refuses to write if that doesn't match what the tool call claims.
 - `interpret_reply`'s LLM fallback (used only for genuinely unclear free text reaching the REST API) has a structured-output schema where `"approved"` is not a legal value - the model can only conclude `"refused"` or `"unclear"`. **Ambiguity can never resolve to an approval.**
 - Negated phrasing ("do not approve", "never confirm this") is caught by a dedicated check before the plain keyword match, so it is never misread as a plain approval.
+
+### Safety in action: an unclear reply never approves
+
+When the administrator types something vague like "maybe", the agent does not guess: it asks for a clear approve or refuse, and nothing is written to the database.
+
+![An ambiguous reply such as "maybe" is not treated as an approval; the agent asks for a clear decision](screenshots/stage2/07-ambiguous-reply.png)
 
 ---
 
@@ -157,41 +170,33 @@ uv run python scripts/admin_cli.py
 
 ### Example: a booking, an approval, and the notification
 
-```
-# Terminal 1 (customer)
-You: book a space for tomorrow 9 to 12, Anna Smith, car AB123CD
-Bot: Your booking PK-EKSG9Z is submitted and pending administrator approval...
+The walkthrough below follows one booking from submission to the customer's notification.
 
-# Terminal 2 (administrator)
-Admin: approve PK-EKSG9Z, looks fine
-Bot: Booking PK-EKSG9Z - Anna Smith
-     Period: 2026-11-20 09:00 to 2026-11-20 12:00
-     Vehicles (1):
-       - AB123CD (car) - pass PK-EKSG9Z-01
-     Reply with APPROVE or REFUSE (optionally followed by a reason).
+#### 1. The customer submits a booking
 
-     You're about to APPROVE this booking (reason: looks fine). Reply yes/confirm to proceed, or no/cancel to back out.
-Admin: yes
-Bot: Done - booking PK-EKSG9Z is now APPROVED.
+The customer gives the details and confirms. The chatbot replies with the booking ID and tells them it is pending administrator approval.
 
-# Terminal 1 (moments later, unprompted)
-Bot: Congrats! Your booking PK-EKSG9Z has been approved.
-```
+![The customer submits a booking and receives a booking ID with "pending administrator approval"](screenshots/stage2/01-user-booking.png)
 
-The administrator's lines (propose/confirm/write) and the customer's background notification were each verified against a real temporary database while writing this document - as two separate runs, not literally side by side in two terminals at once.
+#### 2. The administrator sees it in the pending list
 
-### Example: a refusal
+In the admin console, asking "what's pending?" lists the new request with its details.
 
-A different booking - `PK-EKSG9Z` above is already decided, and a second decision on it would be rejected (see [lifecycle](#the-reservation-lifecycle)):
+![The admin console lists the pending booking with its details](screenshots/stage2/02-admin-pending.png)
 
-```
-Admin: refuse PK-7K3Q9X, no space that day
-Bot: ...You're about to REFUSE this booking (reason: no space that day). Reply yes/confirm to proceed, or no/cancel to back out.
-Admin: yes
-Bot: Done - booking PK-7K3Q9X is now REFUSED.
-```
+#### 3. The administrator asks to approve - and is asked to confirm
 
-The customer's chatbot will report this as refused, with the reason, either automatically (the same background notification) or if asked directly ("is PK-7K3Q9X approved?").
+Saying "approve it" does **not** write anything. The deterministic confirmation flow shows the full booking details and asks for an explicit yes/confirm or no/cancel. This is the human-in-the-loop safety step.
+
+![The admin says "approve it" and is shown the booking details and asked to confirm](screenshots/stage2/03-admin-confirmation.png)
+
+#### 4. The decision is recorded and the customer is notified
+
+Once the administrator confirms, the decision is written and the agent reports the booking as approved. A moment later, without the customer asking, the chatbot tells them. The screenshot shows both terminals side by side, which is where the two agents' database-only communication becomes visible.
+
+![Admin confirms and the booking is approved (left); the customer's chatbot announces the approval unprompted (right)](screenshots/stage2/05-user-notified.png)
+
+
 
 ### The admin REST server (optional)
 
@@ -212,47 +217,17 @@ Every endpoint but `/health` requires `Authorization: Bearer <ADMIN_API_TOKEN>`,
 
 ---
 
-## Project structure
-
-Stage 2 files only:
-
-```
-parking_chatbot/
-  admin/
-    models.py      ApprovalRequest / AdminDecision - the message contract
-    channel.py      AdminChannel protocol; DbAdminChannel (real) and FakeAdminChannel (test)
-    agent.py         the admin agent: tools, system prompt, the deterministic
-                      confirmation flow, and the one shared write path
-    server.py          the optional REST API (FastAPI), reusing that same write path
-  db/
-    admin.py        pending bookings, status/detail lookup, recording a decision
-    database.py      connection helper - WAL mode, busy timeout
-    schema.py         adds escalated_at / decided_at / decision_reason, migrates safely
-  chatbot/
-    reservation_tools.py   submit_reservation escalates; check_booking_status and the
-                            background notifier read decisions back
-    cli.py                   the chatbot's background decision-notification thread
-  config.py          the ADMIN_*/SQL_BUSY_TIMEOUT_MS settings
-scripts/
-  run_admin_server.py   start the admin REST API
-  admin_cli.py            conversational console for the administrator
-tests/
-  admin/, db/test_admin.py, db/test_database.py, db/test_schema.py (admin columns),
-  chatbot/test_reservation_tools.py, chatbot/test_cli.py, scripts/test_admin_cli.py,
-  scripts/test_run_admin_server.py, test_config.py (ADMIN_*/SQL_BUSY_TIMEOUT_MS)
-```
-
----
-
 ## Testing
 
 ```bash
 uv run pytest
 ```
 
-**388 tests pass**, verified just now both locally and in a clean `python:3.11-slim` Docker container built from a pristine checkout (no `.venv`, no `data/parking.db`, no `.env` - only the dummy environment variables CI uses). No test needs real credentials: the LLM, the vector store, and HTTP calls are all replaced with fakes, and every test that touches the database gets its own temporary SQLite file via an **autouse** fixture in `tests/conftest.py` - no test can read or write the real `data/parking.db`, even one that doesn't explicitly ask for the database.
+**415 tests pass** locally as of the admin agent fixes described above (status questions, `get_booking_status`, distinct errors, "approve it"). No test needs real credentials: the LLM, the vector store, and HTTP calls are all replaced with fakes, and every test that touches the database gets its own temporary SQLite file via an **autouse** fixture in `tests/conftest.py` - no test can read or write the real `data/parking.db`, even one that doesn't explicitly ask for the database.
 
-Stage 2 coverage includes: escalation and the shared write path, the deterministic confirmation flow (propose/confirm/cancel/replace, ambiguous and negated text, a forged tool-call argument being ignored in favor of the administrator's real message), idempotent and conflicting repeated decisions, expiry, the REST API's auth and error responses, the admin agent's tool-calling wiring, and the chatbot's background notifier.
+![Output of uv run pytest -q ending with all tests passed](screenshots/stage2/12-pytest-pass.png)
+
+Stage 2 coverage includes: escalation and the shared write path, the deterministic confirmation flow (propose/confirm/cancel/replace/"approve it", ambiguous and negated text, status questions never being read as decisions, a forged tool-call argument being ignored in favor of the administrator's real message), idempotent and conflicting repeated decisions, expiry, the REST API's auth and error responses, the admin agent's tool-calling wiring, and the chatbot's background notifier.
 
 ---
 
@@ -260,7 +235,9 @@ Stage 2 coverage includes: escalation and the shared write path, the determinist
 
 `.gitlab-ci.yml` runs on EPAM GitLab: a Python 3.11 image, `uv sync`, then `uv run pytest --junitxml=report.xml`, on every branch push and merge request, with only dummy `DIAL_*`/`CHAT_MODEL`/`EMBEDDING_MODEL` values (no real credentials) and a cached `uv` environment.
 
-**Honest status:** a pipeline run on the `stage-2` branch (commit `0d2838e3`) failed - 2 of 379 tests, both reaching the real database path by accident because they didn't request the test database fixture. That bug and its root cause (no autouse isolation in `tests/conftest.py`) are fixed as described above, verified locally and in a clean container, but **this fix has not yet been pushed**, so I cannot yet point to a green GitLab run of this exact code. The pipeline is green only if the next run, after these changes are pushed, is.
+![The GitLab pipeline for the stage-2 branch, passing](screenshots/stage2/13-ci-pipeline.png)
+
+**Honest status:** an earlier pipeline run on the `stage-2` branch (commit `0d2838e3`) failed - 2 of 379 tests reaching the real database path by accident. That was fixed, committed (`6d93fa6`) and pushed. The admin-agent fixes described in this document (on top of that commit) are new, uncommitted, and verified locally only - a clean-container rebuild from a pristine checkout, the same way the previous fix was verified, was attempted but could not complete this round (Docker Desktop's engine was not running on the machine). The pipeline is green for *this* code only once it has actually been pushed and run.
 
 ---
 
@@ -269,13 +246,16 @@ Stage 2 coverage includes: escalation and the shared write path, the determinist
 - **Auth fails closed.** If `ADMIN_API_TOKEN` isn't configured, every REST request is rejected rather than left open.
 - **No secrets in code or git.** `.env`, `data/parking.db`, and `data/*.bak` are gitignored and were confirmed (via `git ls-files`) to be untracked; `.env.example` holds placeholders only.
 - **Personal data isn't logged.** The only `logger.*` calls in the admin/chatbot/db code log a guardrail category label (e.g. `"pii:EMAIL_ADDRESS"`), never raw text or PII values.
-- **Minimal disclosure.** `check_booking_status` (the one tool that can look up a booking by ID from the customer side) returns only the bare status and decision reason for the exact ID given - never a name, plate, or other detail, even for an ID that isn't the asking customer's own.
+- **Minimal disclosure.** `check_booking_status` (the one tool that can look up a booking by ID from the customer side) returns only the bare status and decision reason for the exact ID given - never a name, plate, or other detail, even for an ID that isn't the asking customer's own (see the [status check screenshot](#example-checking-a-bookings-status)).
 
 ---
 
 ## Limitations and next steps
 
 - **Cancelling a submitted booking is not supported.** The chatbot refuses any request to cancel, change, or modify a booking that already has an ID, and points the customer to the facility's real contact details instead.
+
+  ![The bot explains it cannot cancel a submitted booking and gives the facility's real contact details](screenshots/stage2/09-cancel-limitation.png)
+
 - **The notification is only as alive as the chatbot process.** It's a background thread inside the running `parking-bot` session, polling the database - it tells the customer about a decision only while that terminal session is open; it is not a push notification to an absent user.
 - **An uninitialized database fails with a generic error, not a friendly one.** If `seed_db.py` has never been run, any tool that touches the `reservations` table (on either side) raises a plain `sqlite3.OperationalError`, caught generically by the CLI's own error handling rather than given a specific "the database hasn't been set up" message. This is unchanged from Stage 1's existing error-handling pattern and was a deliberate choice, not an oversight, when fixing the test gap above - changing it is a separate decision.
 - **`ADMIN_SERVER_URL` is currently dead configuration** - nothing reads it, since `admin_cli.py` talks to the admin agent in-process rather than over HTTP.

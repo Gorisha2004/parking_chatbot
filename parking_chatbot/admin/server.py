@@ -75,6 +75,8 @@ def submit_decision(booking_id: str, body: DecisionRequest) -> dict:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except admin_db.UnknownBookingError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except admin_db.ExpiredBookingError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except admin_db.AlreadyDecidedError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 

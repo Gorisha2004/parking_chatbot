@@ -2,10 +2,11 @@ import json
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from parking_chatbot import config
 from parking_chatbot.admin import agent
 from parking_chatbot.admin.agent import AmbiguousReplyError, DecisionMismatchError, interpret_reply, render_request
 from parking_chatbot.admin.models import ApprovalRequest, RequestVehicle
@@ -13,13 +14,21 @@ from parking_chatbot.db import admin as admin_db
 from parking_chatbot.db.database import get_connection
 
 
-def _insert_pending_booking(booking_id: str = "PK-AAAAAA") -> None:
+def _insert_pending_booking(booking_id: str = "PK-AAAAAA", created_at: datetime | None = None) -> None:
     with closing(get_connection()) as conn, conn:
-        cursor = conn.execute(
-            "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, escalated_at) "
-            "VALUES (?, 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', '2026-11-18T00:00')",
-            (booking_id,),
-        )
+        if created_at is None:
+            cursor = conn.execute(
+                "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, escalated_at) "
+                "VALUES (?, 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', '2026-11-18T00:00')",
+                (booking_id,),
+            )
+        else:
+            cursor = conn.execute(
+                "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, "
+                "escalated_at, created_at) VALUES (?, 'Anna', 'Smith', '2026-11-20T09:00', "
+                "'2026-11-20T12:00', '2026-11-18T00:00', ?)",
+                (booking_id, created_at.strftime("%Y-%m-%d %H:%M:%S")),
+            )
         conn.execute(
             "INSERT INTO reservation_vehicles (reservation_id, pass_id, car_number, vehicle_type) "
             "VALUES (?, ?, 'AB123CD', 'car')",
@@ -198,6 +207,40 @@ def test_update_proposal_does_nothing_for_a_plain_lookup(sql_db):
     assert outcome.action == "none"
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "is PK-AAAAAA approved?",
+        "has PK-AAAAAA been approved yet?",
+        "was PK-AAAAAA refused?",
+        "did you approve PK-AAAAAA",
+    ],
+)
+def test_update_proposal_never_treats_a_status_question_as_a_decision(sql_db, message):
+    """Root cause of the bug report: 'approved'/'refused' match the decision
+    keywords, so a status QUESTION must be recognised and left for the agent
+    (get_booking_status) instead of silently creating or confirming a proposal."""
+    _insert_pending_booking("PK-AAAAAA")
+    tid = _new_thread()
+
+    outcome = agent.update_proposal(tid, message)
+
+    assert outcome.action == "none"
+    assert tid not in agent._proposals
+
+
+def test_update_proposal_leaves_a_pending_proposal_untouched_when_asked_an_unrelated_question(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    tid = _new_thread()
+    agent.update_proposal(tid, "approve PK-AAAAAA")
+
+    outcome = agent.update_proposal(tid, "is it approved yet?")
+
+    assert outcome.action == "none"  # left for the agent to answer
+    assert agent._proposals[tid].booking_id == "PK-AAAAAA"  # proposal still intact, not auto-confirmed
+    assert admin_db.get_booking("PK-AAAAAA")["status"] == "pending"  # and nothing was written
+
+
 def test_update_proposal_creates_a_proposal_from_a_clear_decision(sql_db):
     _insert_pending_booking("PK-AAAAAA")
     outcome = agent.update_proposal(_new_thread(), "approve PK-AAAAAA, looks fine")
@@ -302,6 +345,81 @@ def test_update_proposal_reports_an_error_if_the_booking_was_decided_elsewhere_b
     assert tid not in agent._proposals
 
 
+# --- update_proposal: "approve it" resolves against whatever's in context ------------------------
+
+
+def test_update_proposal_resolves_approve_it_when_exactly_one_booking_is_in_context(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    tid = _new_thread()
+    agent.set_context_bookings(tid, ["PK-AAAAAA"])  # e.g. just shown via get_request_details
+
+    outcome = agent.update_proposal(tid, "approve it")
+
+    assert (outcome.action, outcome.booking.booking_id, outcome.decision) == ("proposed", "PK-AAAAAA", "approved")
+
+
+def test_update_proposal_resolves_a_bare_decision_with_a_reason_against_the_one_in_context(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    tid = _new_thread()
+    agent.set_context_bookings(tid, ["PK-AAAAAA"])
+
+    outcome = agent.update_proposal(tid, "refuse, dates clash")
+
+    assert (outcome.booking.booking_id, outcome.decision, outcome.reason) == ("PK-AAAAAA", "refused", "dates clash")
+
+
+def test_update_proposal_asks_which_booking_when_several_are_in_context(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    _insert_pending_booking("PK-BBBBBB")
+    tid = _new_thread()
+    agent.set_context_bookings(tid, ["PK-AAAAAA", "PK-BBBBBB"])
+
+    outcome = agent.update_proposal(tid, "approve it")
+
+    assert outcome.action == "unclear"
+    assert "PK-AAAAAA" in outcome.message and "PK-BBBBBB" in outcome.message
+    assert tid not in agent._proposals
+
+
+def test_update_proposal_asks_for_an_id_when_nothing_is_in_context(sql_db):
+    tid = _new_thread()
+    outcome = agent.update_proposal(tid, "approve it")
+    assert outcome.action == "unclear"
+    assert "booking ID" in outcome.message
+
+
+def test_update_proposal_maybe_never_approves_with_one_booking_in_context(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    tid = _new_thread()
+    agent.set_context_bookings(tid, ["PK-AAAAAA"])
+
+    outcome = agent.update_proposal(tid, "maybe")
+
+    assert outcome.action == "none"  # no decision language at all - left for the agent
+    assert tid not in agent._proposals
+
+
+def test_update_proposal_maybe_never_approves_with_a_proposal_pending(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    tid = _new_thread()
+    agent.update_proposal(tid, "approve PK-AAAAAA")
+
+    outcome = agent.update_proposal(tid, "maybe")
+
+    assert outcome.action == "unclear"
+    assert admin_db.get_booking("PK-AAAAAA")["status"] == "pending"
+
+
+def test_list_pending_requests_tool_sets_the_context_for_approve_it(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    tid = _new_thread()
+    agent.list_pending_requests.invoke({}, _cfg(tid))
+
+    outcome = agent.update_proposal(tid, "approve it")
+
+    assert outcome.booking.booking_id == "PK-AAAAAA"
+
+
 # --- the agent's tools -----------------------------------------------------------------------------
 
 
@@ -311,7 +429,7 @@ def _cfg(thread_id: str | None = None) -> dict:
 
 def test_list_pending_requests_tool_returns_a_summary_per_booking(sql_db):
     _insert_pending_booking("PK-AAAAAA")
-    result = agent.list_pending_requests.invoke({})
+    result = agent.list_pending_requests.invoke({}, _cfg())
     data = json.loads(result)
     assert data["count"] == 1
     assert data["pending"][0]["booking_id"] == "PK-AAAAAA"
@@ -335,6 +453,68 @@ def test_get_request_details_tool_reports_an_unknown_or_non_pending_booking(sql_
 def test_get_request_details_tool_rejects_an_invalid_id_format(sql_db):
     result = json.loads(agent.get_request_details.invoke({"booking_id": "not-an-id"}, _cfg()))
     assert "not a valid booking ID" in result["error"]
+
+
+# --- get_booking_status: the real status, for any booking, never from memory ---------------------
+
+
+def test_get_booking_status_tool_reports_a_decided_booking(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    admin_db.record_decision("PK-AAAAAA", "refused", "vehicle number doesn't look right")
+
+    result = json.loads(agent.get_booking_status.invoke({"booking_id": "PK-AAAAAA"}, _cfg()))
+
+    assert result["status"] == "refused"
+    assert result["decision_reason"] == "vehicle number doesn't look right"
+    assert result["decided_at"] is not None
+
+
+def test_get_booking_status_tool_reports_an_expired_booking(sql_db, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_REQUEST_EXPIRY_MINUTES", 60)
+    overdue = datetime.now(timezone.utc) - timedelta(minutes=61)
+    _insert_pending_booking("PK-AAAAAA", created_at=overdue)
+
+    result = json.loads(agent.get_booking_status.invoke({"booking_id": "PK-AAAAAA"}, _cfg()))
+
+    assert result["status"] == "expired"
+
+
+def test_get_booking_status_tool_reports_a_pending_booking_and_its_details(sql_db):
+    _insert_pending_booking("PK-AAAAAA")
+    result = json.loads(agent.get_booking_status.invoke({"booking_id": "PK-AAAAAA"}, _cfg()))
+    assert result["status"] == "pending"
+    assert (result["first_name"], result["last_name"]) == ("Anna", "Smith")
+
+
+def test_get_booking_status_tool_reports_an_unknown_id(sql_db):
+    result = json.loads(agent.get_booking_status.invoke({"booking_id": "PK-ZZZZZZ"}, _cfg()))
+    assert "error" in result
+
+
+def test_get_booking_status_sees_a_decision_made_in_a_completely_different_session(sql_db):
+    """Regression for the bug report: the status must come from the database, not
+    from this (or any other) conversation's own memory - a fresh thread that never
+    discussed the booking before must still see a decision made elsewhere."""
+    _insert_pending_booking("PK-AAAAAA")
+    admin_db.record_decision("PK-AAAAAA", "approved", None)  # e.g. decided in an earlier admin session
+
+    fresh_thread_result = json.loads(agent.get_booking_status.invoke({"booking_id": "PK-AAAAAA"}, _cfg(_new_thread())))
+
+    assert fresh_thread_result["status"] == "approved"
+
+
+def test_get_booking_status_tool_lets_record_decision_run_for_a_pending_booking(sql_db):
+    """Calling get_booking_status (not just get_request_details) also satisfies the
+    confirmation gate, since it shows the same details."""
+    _insert_pending_booking("PK-AAAAAA")
+    cfg = _cfg()
+    tid = cfg["configurable"]["thread_id"]
+    agent.get_booking_status.invoke({"booking_id": "PK-AAAAAA"}, cfg)
+    agent.record_admin_message(tid, "approve")
+
+    result = json.loads(agent.record_decision.invoke({"booking_id": "PK-AAAAAA", "decision": "approved"}, cfg))
+
+    assert result["decision"] == "approved"
 
 
 def test_record_decision_tool_refuses_without_get_request_details_first(sql_db):
@@ -377,19 +557,34 @@ def test_record_decision_tool_succeeds_when_the_real_message_matches(sql_db):
     assert admin_db.get_booking("PK-AAAAAA")["status"] == "approved"
 
 
-def test_record_decision_tool_reports_an_already_decided_booking(sql_db):
+def test_record_decision_tool_reports_an_already_decided_booking_with_the_decision_and_when(sql_db):
     _insert_pending_booking("PK-AAAAAA")
+    admin_db.record_decision("PK-AAAAAA", "approved", "looks fine")  # e.g. decided via the REST API
     cfg = _cfg()
     tid = cfg["configurable"]["thread_id"]
-    agent.get_request_details.invoke({"booking_id": "PK-AAAAAA"}, cfg)
-    agent.record_admin_message(tid, "approve")
-    agent.record_decision.invoke({"booking_id": "PK-AAAAAA", "decision": "approved"}, cfg)
-
-    agent.get_request_details.invoke({"booking_id": "PK-AAAAAA"}, cfg)
+    agent._detail_shown.setdefault(tid, set()).add("PK-AAAAAA")  # simulate having been shown it
     agent.record_admin_message(tid, "refuse")
+
     result = json.loads(agent.record_decision.invoke({"booking_id": "PK-AAAAAA", "decision": "refused"}, cfg))
 
     assert "error" in result
+    assert "approved" in result["error"] and "looks fine" in result["error"]
+    assert admin_db.get_booking("PK-AAAAAA")["status"] == "approved"  # unchanged
+
+
+def test_record_decision_tool_reports_an_expired_booking_distinctly(sql_db, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_REQUEST_EXPIRY_MINUTES", 60)
+    overdue = datetime.now(timezone.utc) - timedelta(minutes=61)
+    _insert_pending_booking("PK-AAAAAA", created_at=overdue)
+    cfg = _cfg()
+    tid = cfg["configurable"]["thread_id"]
+    agent._detail_shown.setdefault(tid, set()).add("PK-AAAAAA")
+    agent.record_admin_message(tid, "approve")
+
+    result = json.loads(agent.record_decision.invoke({"booking_id": "PK-AAAAAA", "decision": "approved"}, cfg))
+
+    assert "expired" in result["error"]
+    assert "already" not in result["error"]  # distinct from the "already decided" wording
 
 
 def test_record_decision_tool_reports_an_unknown_booking(sql_db):

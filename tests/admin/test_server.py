@@ -1,4 +1,5 @@
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,13 +28,21 @@ def client(sql_db):
         yield test_client
 
 
-def _insert_pending_booking(booking_id: str = "PK-AAAAAA") -> None:
+def _insert_pending_booking(booking_id: str = "PK-AAAAAA", created_at: str | None = None) -> None:
     with closing(get_connection()) as conn, conn:
-        cursor = conn.execute(
-            "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, escalated_at) "
-            "VALUES (?, 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', '2026-11-18T00:00')",
-            (booking_id,),
-        )
+        if created_at is None:
+            cursor = conn.execute(
+                "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, escalated_at) "
+                "VALUES (?, 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', '2026-11-18T00:00')",
+                (booking_id,),
+            )
+        else:
+            cursor = conn.execute(
+                "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, "
+                "escalated_at, created_at) VALUES (?, 'Anna', 'Smith', '2026-11-20T09:00', "
+                "'2026-11-20T12:00', '2026-11-18T00:00', ?)",
+                (booking_id, created_at),
+            )
         conn.execute(
             "INSERT INTO reservation_vehicles (reservation_id, pass_id, car_number, vehicle_type) "
             "VALUES (?, ?, 'AB123CD', 'car')",
@@ -116,6 +125,18 @@ def test_decision_on_an_already_decided_booking_is_409(client, sql_db):
 
     assert response.status_code == 409
     assert admin_db.get_booking("PK-AAAAAA")["status"] == "approved"  # first decision still stands
+
+
+def test_decision_on_an_expired_booking_is_409_with_a_distinct_message(client, sql_db, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_REQUEST_EXPIRY_MINUTES", 60)
+    overdue = (datetime.now(timezone.utc) - timedelta(minutes=61)).strftime("%Y-%m-%d %H:%M:%S")
+    _insert_pending_booking("PK-AAAAAA", created_at=overdue)
+
+    response = client.post("/requests/PK-AAAAAA/decision", headers=AUTH, json={"reply": "approve"})
+
+    assert response.status_code == 409
+    assert "expired" in response.json()["detail"]
+    assert "already" not in response.json()["detail"]  # distinct wording from "already decided"
 
 
 def test_a_repeated_identical_decision_is_idempotent_not_409(client, sql_db):

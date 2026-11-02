@@ -25,12 +25,27 @@ class UnknownBookingError(AdminBookingError):
 
 
 class AlreadyDecidedError(AdminBookingError):
-    """This booking is no longer pending; the same request cannot be decided twice."""
+    """This booking was already approved or refused; the same request cannot be
+    decided twice. Distinct from ExpiredBookingError below: this means someone
+    actually decided, not that nobody did in time."""
 
-    def __init__(self, booking_id: str, status: str):
-        super().__init__(f"Booking {booking_id} is already {status}, not pending.")
+    def __init__(self, booking_id: str, status: str, decided_at: str | None = None, decision_reason: str | None = None):
+        when = f" on {decided_at}" if decided_at else ""
+        reason_note = f" (reason: {decision_reason})" if decision_reason else ""
+        super().__init__(f"Booking {booking_id} is already {status}{when}{reason_note}.")
         self.booking_id = booking_id
         self.status = status
+        self.decided_at = decided_at
+        self.decision_reason = decision_reason
+
+
+class ExpiredBookingError(AdminBookingError):
+    """This booking was pending but nobody decided before ADMIN_REQUEST_EXPIRY_MINUTES
+    ran out. Distinct from AlreadyDecidedError: there is no decision to report."""
+
+    def __init__(self, booking_id: str):
+        super().__init__(f"Booking {booking_id} expired before a decision was made.")
+        self.booking_id = booking_id
 
 
 def _expire_overdue(conn: sqlite3.Connection) -> None:
@@ -109,6 +124,34 @@ def get_pending_request(booking_id: str) -> ApprovalRequest | None:
         )
 
 
+def get_booking_for_admin(booking_id: str) -> dict | None:
+    """The full details AND the real, current status of one booking, regardless of
+    status (pending, approved, refused or expired) - None if the ID doesn't exist.
+
+    For the administrator, who may see everything about any booking they ask
+    about - unlike get_booking() (status-only, for the customer-facing
+    check_booking_status) and get_pending_request() (full details, but pending only).
+    """
+    with closing(get_connection()) as conn:
+        conn.row_factory = sqlite3.Row
+        _expire_overdue(conn)
+        conn.commit()
+        row = conn.execute("SELECT * FROM reservations WHERE booking_id = ?", (booking_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "booking_id": row["booking_id"],
+            "first_name": row["first_name"],
+            "last_name": row["last_name"],
+            "start": row["start_time"],
+            "end": row["end_time"],
+            "status": row["status"],
+            "decided_at": row["decided_at"],
+            "decision_reason": row["decision_reason"],
+            "vehicles": [v.model_dump() for v in _vehicles_for(conn, row["id"])],
+        }
+
+
 def get_booking(booking_id: str) -> dict | None:
     """The current status of one booking, or None if the ID doesn't exist."""
     with closing(get_connection()) as conn:
@@ -140,17 +183,23 @@ def mark_escalated(booking_id: str) -> None:
 def record_decision(booking_id: str, decision: str, reason: str | None) -> None:
     """Persist the administrator's decision.
 
-    Raises UnknownBookingError for a booking_id that doesn't exist, or
-    AlreadyDecidedError if it is no longer pending (already decided, or expired by
-    the time this runs) - so the same request can never be processed twice.
+    Raises UnknownBookingError for a booking_id that doesn't exist, ExpiredBookingError
+    if it was pending but ran out the clock, or AlreadyDecidedError (with the existing
+    decision and when, so callers can report what actually happened) if someone
+    already decided - so the same request can never be processed twice.
     """
     with closing(get_connection()) as conn, immediate_transaction(conn):
         _expire_overdue(conn)
-        row = conn.execute("SELECT status FROM reservations WHERE booking_id = ?", (booking_id,)).fetchone()
+        row = conn.execute(
+            "SELECT status, decided_at, decision_reason FROM reservations WHERE booking_id = ?", (booking_id,)
+        ).fetchone()
         if row is None:
             raise UnknownBookingError(booking_id)
-        if row[0] != "pending":
-            raise AlreadyDecidedError(booking_id, row[0])
+        status, decided_at, decision_reason = row
+        if status == "expired":
+            raise ExpiredBookingError(booking_id)
+        if status != "pending":
+            raise AlreadyDecidedError(booking_id, status, decided_at, decision_reason)
 
         decided_at = datetime.now().isoformat(timespec="minutes")  # local time, like start_time/end_time
         conn.execute(
