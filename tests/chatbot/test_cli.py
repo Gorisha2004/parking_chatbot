@@ -76,3 +76,58 @@ def test_main_shows_tools_only_in_debug_mode(run_cli):
 def test_main_exits_cleanly_on_end_of_input(run_cli):
     out = run_cli([], lambda agent, msg, tid: ("unused", []))
     assert "Bye!" in out
+
+
+def test_decision_message_for_an_approval_says_congrats():
+    message = cli._decision_message({"booking_id": "PK-ABC123", "status": "approved", "decision_reason": None})
+    assert message == "Congrats! Your booking PK-ABC123 has been approved."
+
+
+def test_decision_message_for_a_refusal_includes_the_reason():
+    message = cli._decision_message({"booking_id": "PK-ABC123", "status": "refused", "decision_reason": "no space"})
+    assert message == "Your booking PK-ABC123 was refused. Reason: no space"
+
+
+def test_decision_message_for_an_expiry_says_so():
+    message = cli._decision_message({"booking_id": "PK-ABC123", "status": "expired", "decision_reason": None})
+    assert "expired" in message
+
+
+def test_announce_decisions_prints_one_message_per_decided_booking(monkeypatch, capsys):
+    bookings = [
+        {"booking_id": "PK-AAA111", "status": "approved", "decision_reason": None},
+        {"booking_id": "PK-BBB222", "status": "refused", "decision_reason": None},
+    ]
+    monkeypatch.setattr(cli, "pending_decisions", lambda thread_id: bookings)
+
+    cli._announce_decisions("some-thread")
+
+    out = capsys.readouterr().out
+    assert "Congrats! Your booking PK-AAA111 has been approved." in out
+    assert "Your booking PK-BBB222 was refused." in out
+
+
+def test_announce_decisions_prints_nothing_when_there_is_no_decision_yet(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "pending_decisions", lambda thread_id: [])
+
+    cli._announce_decisions("some-thread")
+
+    assert capsys.readouterr().out == ""
+
+
+def test_watch_for_decisions_polls_until_told_to_stop(monkeypatch):
+    import threading
+
+    calls = []
+    stop_event = threading.Event()
+
+    def fake_announce(thread_id):
+        calls.append(thread_id)
+        stop_event.set()  # stop after the first poll, so the test doesn't hang
+
+    monkeypatch.setattr(cli, "_announce_decisions", fake_announce)
+    monkeypatch.setattr(cli.config, "ADMIN_NOTIFY_POLL_SECONDS", 0)
+
+    cli._watch_for_decisions("some-thread", stop_event)
+
+    assert calls == ["some-thread"]

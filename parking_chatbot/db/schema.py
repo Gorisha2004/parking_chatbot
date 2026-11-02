@@ -15,7 +15,12 @@ CREATE TABLE IF NOT EXISTS reservations (
     end_time    TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'approved', 'refused', 'expired')),
-    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- Set once the booking has actually been handed to the admin channel (Stage 2);
+    -- NULL means it exists but was never escalated, so it must stay invisible to the admin.
+    escalated_at    TEXT,
+    decided_at      TEXT,
+    decision_reason TEXT
 )"""
 
 RESERVATION_VEHICLES_TABLE_SQL = """
@@ -69,6 +74,21 @@ def create_tables() -> None:
         if _has_legacy_reservations(conn):
             _migrate_legacy_reservations(conn)
         conn.executescript(SCHEMA_SQL)
+        _add_missing_columns(
+            conn, "reservations", {"escalated_at": "TEXT", "decided_at": "TEXT", "decision_reason": "TEXT"}
+        )
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """Add any of these columns the table doesn't already have. Safe to run every time;
+    CREATE TABLE IF NOT EXISTS alone never adds columns to a table that already exists."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    missing = {name: sql_type for name, sql_type in columns.items() if name not in existing}
+    if not missing:
+        return
+    with conn:
+        for name, sql_type in missing.items():
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
 def _has_legacy_reservations(conn: sqlite3.Connection) -> bool:

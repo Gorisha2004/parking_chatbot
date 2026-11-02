@@ -51,6 +51,42 @@ def test_create_tables_is_safe_to_run_twice(sql_db):
     assert "reservations_legacy" not in _tables()
 
 
+def _reservation_columns() -> set[str]:
+    with closing(get_connection()) as conn:
+        return {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
+
+
+def test_fresh_database_has_the_admin_decision_columns(sql_db):
+    assert {"escalated_at", "decided_at", "decision_reason"} <= _reservation_columns()
+
+
+def test_upgrades_a_pre_stage2_reservations_table_without_losing_data(sql_db):
+    # The shape reservations had before Stage 2 added escalation/decision columns.
+    pre_stage2_layout = (
+        "CREATE TABLE reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT NOT NULL UNIQUE, "
+        "first_name TEXT NOT NULL, last_name TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    with closing(get_connection()) as conn, conn:
+        conn.execute("DROP TABLE reservation_vehicles")
+        conn.execute("DROP TABLE reservations")
+        conn.execute(pre_stage2_layout)
+        conn.execute(
+            "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, status) "
+            "VALUES ('PK-OLD001', 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', 'approved')"
+        )
+
+    create_tables()
+
+    assert {"escalated_at", "decided_at", "decision_reason"} <= _reservation_columns()
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT first_name, status, escalated_at, decided_at, decision_reason FROM reservations "
+            "WHERE booking_id = 'PK-OLD001'"
+        ).fetchone()
+    assert row == ("Anna", "approved", None, None, None)
+
+
 def test_upgrades_the_original_one_vehicle_per_row_layout(sql_db):
     _replace_reservations_with(
         ORIGINAL_LAYOUT,

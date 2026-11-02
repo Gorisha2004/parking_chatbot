@@ -4,12 +4,15 @@ import re
 import uuid
 from contextlib import closing
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import pytest
 
 from parking_chatbot import config
+from parking_chatbot.admin.channel import FakeAdminChannel
 from parking_chatbot.chatbot import reservation_tools as rt
 from parking_chatbot.chatbot.tools import ALL_TOOLS
+from parking_chatbot.db import admin as admin_db
 from parking_chatbot.db.database import get_connection
 
 BOOKING_ID = re.compile(r"^PK-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$")
@@ -170,6 +173,41 @@ def test_full_group_booking_returns_booking_id_and_one_pass_per_vehicle(cfg, cap
     assert _call(rt.update_reservation_details, {}, cfg)["still_missing"] == rt.REQUIRED_FIELDS
 
 
+def test_submit_reservation_escalates_through_the_real_admin_channel(cfg, capacity):
+    """No fake here: proves the real DbAdminChannel is wired in, not only tested via a fake."""
+    _fill(cfg, plates=("AAA111",))
+    _call(rt.show_reservation_summary, {}, cfg)
+    result = _call(rt.submit_reservation, {}, cfg)
+    [pending] = admin_db.list_pending_bookings()
+    assert pending.booking_id == result["booking_id"]
+
+
+def test_submit_reservation_does_not_depend_on_the_admin_server_being_up(cfg, capacity):
+    """Escalation must be a local write, never a network call - so submitting a
+    reservation can never fail just because the admin server isn't running."""
+    _fill(cfg, plates=("AAA111",))
+    _call(rt.show_reservation_summary, {}, cfg)
+    with patch("socket.socket.connect", side_effect=AssertionError("must not open a network connection")):
+        result = _call(rt.submit_reservation, {}, cfg)
+    assert result["status"] == "pending"
+
+
+def test_submit_reservation_sends_the_request_through_whichever_channel_is_injected(cfg, capacity, monkeypatch):
+    fake = FakeAdminChannel()
+    monkeypatch.setattr(rt, "get_admin_channel", lambda: fake)
+
+    _fill(cfg, plates=("AAA111", "BBB222"))
+    _call(rt.show_reservation_summary, {}, cfg)
+    result = _call(rt.submit_reservation, {}, cfg)
+
+    [sent] = fake.sent
+    assert sent.booking_id == result["booking_id"]
+    assert (sent.first_name, sent.last_name) == ("Anna", "Smith")
+    assert [v.car_number for v in sent.vehicles] == ["AAA111", "BBB222"]
+    # a fake channel never calls mark_escalated, so the admin API would not see it:
+    assert admin_db.list_pending_bookings() == []
+
+
 def test_submit_rechecks_capacity_taken_after_the_summary(cfg, capacity):
     capacity(3)
     _fill(cfg, plates=("AAA111", "BBB222"))
@@ -199,11 +237,192 @@ def test_cancel_reservation_clears_the_draft(cfg):
     assert _call(rt.update_reservation_details, {}, cfg)["still_missing"] == rt.REQUIRED_FIELDS
 
 
+def test_cancel_reservation_reports_a_draft_was_discarded(cfg):
+    _fill(cfg)
+    result = _call(rt.cancel_reservation, {}, cfg)
+    assert result["status"] == "draft discarded"
+
+
+def test_cancel_reservation_is_honest_when_there_is_nothing_to_discard(cfg):
+    """Regression test: calling this with no draft in progress (for example because
+    the user actually wanted to cancel an already-submitted booking) must not claim
+    something was discarded - that was the misleading message from the bug report."""
+    result = _call(rt.cancel_reservation, {}, cfg)
+    assert result["status"] == "nothing to discard"
+    assert "cannot be cancelled" in result["message"]
+
+
+def test_cancel_reservation_after_submission_is_also_honest(cfg, capacity):
+    """Exact bug scenario: a booking was already submitted (draft cleared on success),
+    then the user asks to cancel it by calling cancel_reservation again."""
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    _call(rt.submit_reservation, {}, cfg)
+
+    result = _call(rt.cancel_reservation, {}, cfg)
+
+    assert result["status"] == "nothing to discard"
+
+
+# --- Status checks --------------------------------------------------------------------------------
+
+
+def test_check_booking_status_with_no_id_and_none_on_record_asks_for_one(cfg):
+    result = _call(rt.check_booking_status, {}, cfg)
+    assert "booking ID" in result["error"]
+
+
+def test_check_booking_status_rejects_an_invalid_id_format(cfg):
+    result = _call(rt.check_booking_status, {"booking_id": "not-an-id"}, cfg)
+    assert "not a valid booking ID" in result["error"]
+
+
+def test_check_booking_status_reports_an_unknown_id(cfg):
+    result = _call(rt.check_booking_status, {"booking_id": "PK-ZZZZZZ"}, cfg)
+    assert "No booking found" in result["error"]
+
+
+def test_check_booking_status_normalises_the_id_before_looking_it_up(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+
+    other = _new_cfg()
+    result = _call(rt.check_booking_status, {"booking_id": f" {booking['booking_id'].lower()} "}, other)
+
+    assert result["status"] == "pending"
+    rt._clear(other["configurable"]["thread_id"])
+
+
+def test_check_booking_status_reports_pending_right_after_submission(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+
+    result = _call(rt.check_booking_status, {"booking_id": booking["booking_id"]}, cfg)
+
+    assert result == {"booking_id": booking["booking_id"], "status": "pending", "decision_reason": None}
+
+
+def test_check_booking_status_reflects_an_approval_with_its_reason(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+    admin_db.record_decision(booking["booking_id"], "approved", "looks fine")
+
+    result = _call(rt.check_booking_status, {"booking_id": booking["booking_id"]}, cfg)
+
+    assert (result["status"], result["decision_reason"]) == ("approved", "looks fine")
+
+
+def test_check_booking_status_without_an_id_uses_the_one_just_submitted(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+
+    result = _call(rt.check_booking_status, {}, cfg)
+
+    assert result["booking_id"] == booking["booking_id"]
+
+
+def test_check_booking_status_without_an_id_uses_the_one_last_checked(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+    _call(rt.check_booking_status, {}, cfg)  # remembers it from submission
+
+    # a second conversation that explicitly checked this ID once should also be able
+    # to ask again without repeating it:
+    other = _new_cfg()
+    _call(rt.check_booking_status, {"booking_id": booking["booking_id"]}, other)
+    result = _call(rt.check_booking_status, {}, other)
+    assert result["booking_id"] == booking["booking_id"]
+    rt._clear(other["configurable"]["thread_id"])
+
+
+def test_check_booking_status_does_not_remember_a_failed_lookup(cfg):
+    _call(rt.check_booking_status, {"booking_id": "PK-ZZZZZZ"}, cfg)
+    result = _call(rt.check_booking_status, {}, cfg)
+    assert "booking ID" in result["error"]  # still nothing on record, not the unknown ID
+
+
+def test_check_booking_status_never_returns_more_than_id_status_and_reason(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+
+    result = _call(rt.check_booking_status, {"booking_id": booking["booking_id"]}, cfg)
+
+    assert set(result) == {"booking_id", "status", "decision_reason"}
+
+
+# --- Notifying the user once a decision is made --------------------------------------------------
+
+
+def test_pending_decisions_reports_nothing_while_still_pending(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    _call(rt.submit_reservation, {}, cfg)
+
+    assert rt.pending_decisions(cfg["configurable"]["thread_id"]) == []
+
+
+def test_pending_decisions_reports_an_approval_with_congrats_wording(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+    admin_db.record_decision(booking["booking_id"], "approved", None)
+
+    [decided] = rt.pending_decisions(cfg["configurable"]["thread_id"])
+
+    assert (decided["booking_id"], decided["status"]) == (booking["booking_id"], "approved")
+
+
+def test_pending_decisions_reports_a_refusal_with_its_reason(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+    admin_db.record_decision(booking["booking_id"], "refused", "no space that day")
+
+    [decided] = rt.pending_decisions(cfg["configurable"]["thread_id"])
+
+    assert (decided["status"], decided["decision_reason"]) == ("refused", "no space that day")
+
+
+def test_pending_decisions_reports_each_decided_booking_only_once(cfg, capacity):
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    booking = _call(rt.submit_reservation, {}, cfg)
+    admin_db.record_decision(booking["booking_id"], "approved", None)
+    tid = cfg["configurable"]["thread_id"]
+
+    assert len(rt.pending_decisions(tid)) == 1
+    assert rt.pending_decisions(tid) == []
+
+
+def test_pending_decisions_keeps_tracking_bookings_still_pending_after_a_poll(cfg, capacity):
+    _fill(cfg, plates=("AAA111",))
+    _call(rt.show_reservation_summary, {}, cfg)
+    first = _call(rt.submit_reservation, {}, cfg)
+    _fill(cfg, plates=("BBB222",))
+    _call(rt.show_reservation_summary, {}, cfg)
+    second = _call(rt.submit_reservation, {}, cfg)
+    admin_db.record_decision(first["booking_id"], "approved", None)
+    tid = cfg["configurable"]["thread_id"]
+
+    assert [d["booking_id"] for d in rt.pending_decisions(tid)] == [first["booking_id"]]
+
+    admin_db.record_decision(second["booking_id"], "refused", None)
+    assert [d["booking_id"] for d in rt.pending_decisions(tid)] == [second["booking_id"]]
+
+
 # --- Privacy -------------------------------------------------------------------------------------
 
 
-def test_no_tool_can_look_up_a_booking_by_id():
+def test_no_tool_other_than_the_status_check_can_look_up_a_booking_by_id():
     for agent_tool in ALL_TOOLS:
+        if agent_tool.name == "check_booking_status":
+            continue  # the one sanctioned exception - see its own tests below
         params = set(inspect.signature(agent_tool.func).parameters)
         assert not params & {"booking_id", "pass_id", "reservation_id"}, agent_tool.name
 
@@ -223,6 +442,9 @@ def test_another_conversation_cannot_see_a_booking_even_with_its_ids(cfg, capaci
         rt.show_reservation_summary.invoke({}, stranger),
         rt.submit_reservation.invoke({}, stranger),
         rt.cancel_reservation.invoke({}, stranger),
+        # check_booking_status CAN look this ID up (by design - see its own tests),
+        # but must still never reveal the booker's name or plates, only the status.
+        rt.check_booking_status.invoke({"booking_id": booking["booking_id"]}, stranger),
     ]
     rt._clear(stranger["configurable"]["thread_id"])
 

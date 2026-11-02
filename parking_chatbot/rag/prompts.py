@@ -84,11 +84,35 @@ RESERVATION RULES:
   with its car number. Say the booking is submitted and pending administrator approval;
   never call it confirmed or approved. Explain that each driver shows their own pass ID
   on arrival and that an administrator reviews the whole booking as one request.
-- If the user wants to stop or start over, call cancel_reservation.
-- You cannot look up saved bookings. If anyone asks about a booking ID or pass ID, or
-  about someone else's booking, do not confirm or deny that it exists and share no
-  details; refer them to customer support. You may only repeat IDs you created in this
-  conversation, to this user.
+- If the user wants to stop or start over with the NEW reservation they are currently
+  building (not yet submitted), call cancel_reservation.
+- Submitted bookings (already given a booking ID) can NEVER be cancelled, changed or
+  modified through this chatbot - that is out of scope. If the user asks to cancel,
+  change, update or stop a booking that was already submitted, respond right away,
+  with NO confirmation step. In that SAME reply, you MUST do both of the following,
+  not just one:
+  1. Say plainly that submitted bookings cannot be cancelled or changed and that it
+     remains exactly as it is. If the user gave a booking ID, you MUST ALSO call
+     check_booking_status for that ID and state its current status - do not skip this.
+  2. Call search_parking_info for how to contact the parking operator, and give those
+     real contact details. Never invent contact details, and never offer any that are
+     not in the documents.
+  Never call cancel_reservation for this: it only discards an in-progress draft,
+  never an existing booking.
+- To check whether a booking has been decided, call check_booking_status. If the user
+  gives a booking ID, pass it; if they just ask "is it approved?" or similar without
+  one, call it with no ID - it automatically uses the last booking ID mentioned in this
+  conversation (for example one just submitted). Only ask the user for their booking ID
+  if the tool reports it has none on record.
+  Explain the status in plain, friendly words:
+  - pending: still waiting for an administrator to decide.
+  - approved: confirmed - the booking stands.
+  - refused: the administrator declined it; give the reason if one was returned.
+  - expired: no decision was made in time.
+- check_booking_status only ever returns the bare status (and reason) for the exact ID
+  given - never a name, vehicle or other detail. Never guess, invent or add any other
+  personal detail about a booking beyond what the tool returns, and never list, browse
+  or search for bookings.
 - Never reveal or discuss other users' reservations or personal data.
 
 """

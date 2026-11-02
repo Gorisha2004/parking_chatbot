@@ -894,6 +894,23 @@ wheels = [
 ]
 
 [[package]]
+name = "fastapi"
+version = "0.162.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "opentelemetry-api" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e9/eb/2cf8c80abf09b2800aef0a83b41066fbfda8ee5495b7a08b9d1af40f7046/fastapi-0.162.0.tar.gz", hash = "sha256:6a22c1e2e6e32e0633ee7e170f00009a29b8228b16feb219ee42f32fd8d88a8f", size = 527867, upload-time = "2026-10-23T18:47:33.264Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b4/4f/3f2c25c9b43970b5e9a08beb5e04776247edea684ddc0930f4f02f0bb6cb/fastapi-0.162.0-py3-none-any.whl", hash = "sha256:3785963de305dd09912426cb81f2d230fce98ab3521cdfe97265c8d14983128c", size = 148912, upload-time = "2026-10-23T18:47:31.734Z" },
+]
+
+[[package]]
 name = "filelock"
 version = "4.2.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2654,6 +2671,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "en-core-web-lg" },
+    { name = "fastapi" },
     { name = "langchain" },
     { name = "langchain-chroma" },
     { name = "langchain-community" },
@@ -2664,6 +2682,7 @@ dependencies = [
     { name = "presidio-anonymizer" },
     { name = "python-dotenv" },
     { name = "requests" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -2674,6 +2693,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "en-core-web-lg", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl" },
+    { name = "fastapi", specifier = ">=0.162.0" },
     { name = "langchain", specifier = ">=1.4.7" },
     { name = "langchain-chroma", specifier = ">=1.1.0" },
     { name = "langchain-community", specifier = ">=0.4.2" },
@@ -2684,6 +2704,7 @@ requires-dist = [
     { name = "presidio-anonymizer", specifier = ">=2.2.366" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
     { name = "requests", specifier = ">=2.34.2" },
+    { name = "uvicorn", specifier = ">=0.54.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -4018,6 +4039,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/03/65/7da72cb1b78b8441430216fbd380264d0f8cb74735f22f3aa39d5e22d309/srsly-2.5.5-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:19d04dd102a3728ed02a92a3e64cb8c577b9db02e8862209cd603cd0a62f87d7", size = 1288110, upload-time = "2026-10-25T00:02:51.458Z" },
     { url = "https://files.pythonhosted.org/packages/99/1b/e2c1551bf5bd38e99a282537a561f0e439a8718f91329efce874bc4948c2/srsly-2.5.5-cp315-cp315t-win_amd64.whl", hash = "sha256:16795b5c08cc1c5c2bd39482cb261e7222c0016d99616654f24b804b71c92386", size = 682652, upload-time = "2026-10-25T00:02:52.872Z" },
     { url = "https://files.pythonhosted.org/packages/d2/85/802015f2c3a98a28a899b3b9b7021ea988f24cc7dad3a07d60a29c99a7f7/srsly-2.5.5-cp315-cp315t-win_arm64.whl", hash = "sha256:71dc14479287a9e1a05058f2059cc44a062e2e0887db93f2b95c2ecccf0e3584", size = 676233, upload-time = "2026-10-25T00:02:54.751Z" },
+]
+
+[[package]]
+name = "starlette"
+version = "1.10.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/48/bb/3d8757f21e9a53d9035c9eb039a777047139a16bfdbedfc7a58241c3d914/starlette-1.10.0.tar.gz", hash = "sha256:b8399098d4c1e3522734f7235dc79b1fc967f96cf139c81e0fa30479e0685f9b", size = 2734356, upload-time = "2026-10-24T15:04:12.342Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/2e/947cfe02def9371c07cd5bf5b6b61c829e9aecb9904db02a66cfafbc1eec/starlette-1.10.0-py3-none-any.whl", hash = "sha256:478c0ab3b4ced6e82719849c118fa406f0278a3499c1a898cd15cd31bdc38ce4", size = 80571, upload-time = "2026-10-24T15:04:10.371Z" },
 ]
 
 [[package]]

@@ -1,23 +1,38 @@
 """Tools the agent uses to collect, confirm and submit a (group) reservation.
 
 Every tool works only on the current conversation's draft: none of them can read
-saved bookings, so no conversation can reveal another person's reservation.
+saved bookings, so no conversation can reveal another person's reservation. The one
+exception is check_booking_status, which can look up any booking ID given to it - but
+it only ever returns that booking's bare status, never a name, plate or other detail.
 """
 import json
+import re
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from pydantic import BaseModel, ValidationError
 
 from parking_chatbot import config as settings
+from parking_chatbot.admin.channel import get_admin_channel
+from parking_chatbot.admin.models import ApprovalRequest, RequestVehicle
+from parking_chatbot.db import admin as admin_db
 from parking_chatbot.db.reservations import NotEnoughSpacesError, create_reservation, get_free_spaces
+from parking_chatbot.reservation.ids import BOOKING_ID_LENGTH, BOOKING_ID_PREFIX, ID_ALPHABET
 from parking_chatbot.reservation.models import REQUIRED_FIELDS, ReservationDraft, Vehicle
 
 DETAIL_FIELDS = ["first_name", "last_name", "start", "end"]
+BOOKING_ID_PATTERN = re.compile(rf"^{BOOKING_ID_PREFIX}-[{ID_ALPHABET}]{{{BOOKING_ID_LENGTH}}}$")
 
 # One draft per conversation, keyed by thread_id (in memory, like the chat history).
 _drafts: dict[str, ReservationDraft] = {}
 _summary_shown: set[str] = set()
+# The last booking ID mentioned in each conversation (submitted, or already looked
+# up), so "is it approved yet?" works without repeating the ID every time.
+_last_booking_id: dict[str, str] = {}
+# Booking IDs submitted in each conversation that have not yet been reported back to
+# the user as decided. Polled by the CLI in the background (see chatbot/cli.py) so the
+# user hears about an administrator's decision without having to ask.
+_submitted_booking_ids: dict[str, list[str]] = {}
 
 
 class VehicleInput(BaseModel):
@@ -176,6 +191,18 @@ def submit_reservation(config: RunnableConfig) -> str:
         _summary_shown.discard(tid)
         return _not_enough_spaces(error.free, error.needed)
 
+    request = ApprovalRequest(
+        booking_id=saved.booking_id,
+        first_name=draft.first_name,
+        last_name=draft.last_name,
+        start=draft.start,
+        end=draft.end,
+        vehicles=[RequestVehicle(pass_id=p.pass_id, car_number=p.car_number, vehicle_type=p.vehicle_type) for p in saved.passes],
+    )
+    get_admin_channel().send_request(request)
+
+    _last_booking_id[tid] = saved.booking_id
+    _submitted_booking_ids.setdefault(tid, []).append(saved.booking_id)
     _clear(tid)
     return json.dumps(
         {
@@ -193,9 +220,78 @@ def submit_reservation(config: RunnableConfig) -> str:
 
 @tool
 def cancel_reservation(config: RunnableConfig) -> str:
-    """Discard the reservation being collected, if the user changes their mind."""
-    _clear(_thread_id(config))
-    return json.dumps({"status": "reservation draft discarded"})
+    """Discard the NEW reservation currently being built (collected but not yet
+    submitted), if the user changes their mind about it.
+
+    This can NEVER cancel, change or otherwise affect a booking that has already
+    been submitted - that is out of scope. Submitted bookings cannot be cancelled;
+    use check_booking_status to report a submitted booking's status instead."""
+    tid = _thread_id(config)
+    had_draft = tid in _drafts
+    _clear(tid)
+    if had_draft:
+        return json.dumps(
+            {"status": "draft discarded", "message": "The in-progress reservation you were building has been discarded."}
+        )
+    return json.dumps(
+        {
+            "status": "nothing to discard",
+            "message": "There was no in-progress reservation draft to discard. This does not "
+            "affect any already-submitted booking - submitted bookings cannot be cancelled.",
+        }
+    )
+
+
+@tool
+def check_booking_status(config: RunnableConfig, booking_id: str | None = None) -> str:
+    """Check the status of a reservation by its booking ID (for example PK-GC6ZMZ).
+    If the user asks about status without giving an ID, omit this argument: the last
+    booking ID mentioned in this conversation (for example one just submitted) is used
+    automatically. If none is on record, this returns an error asking for one - ask the
+    user for their booking ID rather than guessing it.
+    Returns the status (pending, approved, refused or expired) and the administrator's
+    reason if there is one. This never returns anyone's name, vehicle or other personal
+    detail - only the bare status for the exact ID given, read-only."""
+    tid = _thread_id(config)
+    if booking_id is None:
+        booking_id = _last_booking_id.get(tid)
+        if booking_id is None:
+            return json.dumps(
+                {"error": "No booking ID was given, and none has come up yet in this conversation. Ask the user for their booking ID."}
+            )
+    else:
+        booking_id = booking_id.strip().upper()
+        if not BOOKING_ID_PATTERN.match(booking_id):
+            return json.dumps({"error": f"'{booking_id}' is not a valid booking ID. It should look like PK-XXXXXX."})
+
+    result = admin_db.get_booking(booking_id)
+    if result is None:
+        return json.dumps({"error": f"No booking found with ID {booking_id}."})
+
+    _last_booking_id[tid] = booking_id
+    return json.dumps(
+        {
+            "booking_id": result["booking_id"],
+            "status": result["status"],
+            "decision_reason": result["decision_reason"],
+        }
+    )
+
+
+def pending_decisions(thread_id: str) -> list[dict]:
+    """Bookings submitted in this conversation that have just been decided (no longer
+    pending). Not an agent tool - called by the CLI's background notifier, not the LLM.
+    Each booking is reported once: it stops being tracked as soon as it is returned."""
+    still_pending = []
+    decided = []
+    for booking_id in _submitted_booking_ids.get(thread_id, []):
+        booking = admin_db.get_booking(booking_id)
+        if booking is None or booking["status"] == "pending":
+            still_pending.append(booking_id)
+        else:
+            decided.append(booking)
+    _submitted_booking_ids[thread_id] = still_pending
+    return decided
 
 
 RESERVATION_TOOLS = [
@@ -205,4 +301,5 @@ RESERVATION_TOOLS = [
     show_reservation_summary,
     submit_reservation,
     cancel_reservation,
+    check_booking_status,
 ]
