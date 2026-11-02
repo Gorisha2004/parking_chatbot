@@ -277,7 +277,7 @@ def test_check_booking_status_rejects_an_invalid_id_format(cfg):
     assert "not a valid booking ID" in result["error"]
 
 
-def test_check_booking_status_reports_an_unknown_id(cfg):
+def test_check_booking_status_reports_an_unknown_id(cfg, sql_db):
     result = _call(rt.check_booking_status, {"booking_id": "PK-ZZZZZZ"}, cfg)
     assert "No booking found" in result["error"]
 
@@ -340,7 +340,7 @@ def test_check_booking_status_without_an_id_uses_the_one_last_checked(cfg, capac
     rt._clear(other["configurable"]["thread_id"])
 
 
-def test_check_booking_status_does_not_remember_a_failed_lookup(cfg):
+def test_check_booking_status_does_not_remember_a_failed_lookup(cfg, sql_db):
     _call(rt.check_booking_status, {"booking_id": "PK-ZZZZZZ"}, cfg)
     result = _call(rt.check_booking_status, {}, cfg)
     assert "booking ID" in result["error"]  # still nothing on record, not the unknown ID
