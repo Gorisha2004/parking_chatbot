@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,6 +41,47 @@ ADMIN_SERVER_URL = os.getenv("ADMIN_SERVER_URL", "http://127.0.0.1:8001")
 ADMIN_NOTIFY_POLL_SECONDS = int(os.getenv("ADMIN_NOTIFY_POLL_SECONDS", "3"))
 if ADMIN_NOTIFY_POLL_SECONDS <= 0:
     raise ValueError("ADMIN_NOTIFY_POLL_SECONDS must be positive.")
+# start_time, end_time and decided_at are all stored naive, in the facility's own
+# wall-clock time (never converted at write time - see reservation/models.py and
+# db/admin.py). Stage 3 is the first thing that needs an unambiguous UTC instant
+# (for the reservation file), so this is the one place that time zone is named -
+# an IANA zone, e.g. "Europe/Berlin". Default "UTC" means "treat the naive values
+# as already UTC" - a safe no-op conversion, not a guess at the facility's real zone.
+FACILITY_TIMEZONE = os.getenv("FACILITY_TIMEZONE", "UTC")
+try:
+    ZoneInfo(FACILITY_TIMEZONE)
+except ZoneInfoNotFoundError as error:
+    raise ValueError(f"FACILITY_TIMEZONE {FACILITY_TIMEZONE!r} is not a known IANA time zone name.") from error
+
+# --- Stage 3: recording approved reservations to a file via the MCP server --------------------
+
+# Where scripts/run_mcp_server.py listens; the recording client (parking_chatbot.recording)
+# talks to it here.
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8002")
+# Bearer token the recording server requires on every request. No default: if it is
+# not set (or set to an empty string), the server refuses to start and the client
+# refuses to send - fail closed, like ADMIN_API_TOKEN, but stricter: this one isn't
+# allowed to come up at all in a half-configured state. Enforced where this is
+# actually used (the server's startup, the client's send function), not here - this
+# module is imported by everything, including code that has nothing to do with
+# Stage 3, so it must not force every process to have this token set just to start.
+MCP_API_TOKEN = os.getenv("MCP_API_TOKEN")
+# The reservation file's path, resolved once, here, against the project root - not a
+# bare relative string like SQL_DB_PATH, which means whatever the process's current
+# directory happens to be. A relative value is relative to the project root
+# regardless of where the command was run from; an absolute value is used as-is.
+MCP_RESERVATIONS_FILE_PATH = (PROJECT_ROOT / os.getenv("MCP_RESERVATIONS_FILE_PATH", "data/reservations.txt")).resolve()
+# How often the background sweep retries approved bookings the server hasn't
+# confirmed recording yet. At least 5s: anything shorter is really a busy-loop, not
+# a retry interval.
+MCP_RETRY_INTERVAL_SECONDS = int(os.getenv("MCP_RETRY_INTERVAL_SECONDS", "30"))
+if MCP_RETRY_INTERVAL_SECONDS < 5:
+    raise ValueError("MCP_RETRY_INTERVAL_SECONDS must be at least 5 seconds.")
+# How long the recording client waits for one HTTP call to the server before giving
+# up. At least 1s: anything shorter is unreliable even for a local network call.
+MCP_REQUEST_TIMEOUT_SECONDS = int(os.getenv("MCP_REQUEST_TIMEOUT_SECONDS", "5"))
+if MCP_REQUEST_TIMEOUT_SECONDS < 1:
+    raise ValueError("MCP_REQUEST_TIMEOUT_SECONDS must be at least 1 second.")
 
 # Path is Python’s modern way to work with file paths (it handles / vs \ for Windows/Mac automatically).
 # __file__ is a built-in variable holding the path of the current file (config.py).

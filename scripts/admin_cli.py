@@ -10,6 +10,8 @@ import traceback
 import uuid
 
 from parking_chatbot.admin.agent import admin_chat, build_admin_agent
+from parking_chatbot.db.schema import create_tables
+from parking_chatbot.recording.client import start_retry_sweep_thread
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
 
@@ -22,10 +24,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    create_tables()  # safe to run every time; migrates an older database in place
     agent = build_admin_agent()
     thread_id = str(uuid.uuid4())  # one new conversation per program run
     print("CityPark Central - Admin console. Type 'q' to quit.\n")
 
+    stop_sweep = start_retry_sweep_thread()
+    try:
+        _run_loop(agent, thread_id, args)
+    finally:
+        stop_sweep.set()
+
+
+def _run_loop(agent, thread_id: str, args: argparse.Namespace) -> None:
     while True:
         try:
             admin_input = input("Admin: ").strip()

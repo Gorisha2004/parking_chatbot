@@ -36,3 +36,16 @@ class AdminDecision(BaseModel):
     booking_id: str
     decision: Literal["approved", "refused"]
     reason: str | None = None
+
+
+class ApprovedBooking(BaseModel):
+    """An approved booking not yet confirmed written to the reservation file
+    (Stage 3) - everything recording needs: who, when approved, and every vehicle."""
+
+    booking_id: str
+    first_name: str
+    last_name: str
+    start: datetime
+    end: datetime
+    decided_at: datetime
+    vehicles: list[RequestVehicle]

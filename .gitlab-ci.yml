@@ -27,6 +27,11 @@ variables:
   DIAL_API_VERSION: "2024-01-01"
   CHAT_MODEL: "dummy-chat-model"
   EMBEDDING_MODEL: "dummy-embedding-model"
+  # Stage 3: required, no default - tests monkeypatch it directly where a specific
+  # value matters, this just stands in so config.py (imported by everything) never
+  # sees it genuinely unset in CI. Must be >= MIN_TOKEN_LENGTH (32) itself, in case
+  # anything ever exercises the real startup check against this value directly.
+  MCP_API_TOKEN: "dummy-mcp-token-for-ci-pipeline-only"
 
 pytest:
   stage: test

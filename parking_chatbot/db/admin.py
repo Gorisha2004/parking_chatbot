@@ -8,7 +8,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 from parking_chatbot import config
-from parking_chatbot.admin.models import ApprovalRequest, RequestVehicle
+from parking_chatbot.admin.models import ApprovalRequest, ApprovedBooking, RequestVehicle
 from parking_chatbot.db.database import get_connection, immediate_transaction
 
 
@@ -205,4 +205,43 @@ def record_decision(booking_id: str, decision: str, reason: str | None) -> None:
         conn.execute(
             "UPDATE reservations SET status = ?, decided_at = ?, decision_reason = ? WHERE booking_id = ?",
             (decision, decided_at, reason, booking_id),
+        )
+
+
+def list_unrecorded_approved_bookings() -> list[ApprovedBooking]:
+    """Every approved booking not yet confirmed written to the reservation file
+    (Stage 3) - refused, pending and expired bookings are never returned here, which
+    is how "only approved reservations reach the recording server" holds on this
+    side of the integration."""
+    with closing(get_connection()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM reservations WHERE status = 'approved' AND recorded_at IS NULL ORDER BY decided_at"
+        ).fetchall()
+        return [
+            ApprovedBooking(
+                booking_id=row["booking_id"],
+                first_name=row["first_name"],
+                last_name=row["last_name"],
+                start=datetime.fromisoformat(row["start_time"]),
+                end=datetime.fromisoformat(row["end_time"]),
+                decided_at=datetime.fromisoformat(row["decided_at"]),
+                vehicles=_vehicles_for(conn, row["id"]),
+            )
+            for row in rows
+        ]
+
+
+def mark_recorded(booking_id: str) -> None:
+    """Record that this booking's line(s) are confirmed written to the reservation
+    file - including when the recording server reports it was already there, which
+    counts as success. Idempotent, same pattern as mark_escalated: a second call
+    keeps the original timestamp rather than overwriting it. A no-op for a booking
+    that isn't (or is no longer) approved - recorded_at only ever means anything
+    for an approved booking."""
+    with closing(get_connection()) as conn, conn:
+        conn.execute(
+            "UPDATE reservations SET recorded_at = COALESCE(recorded_at, ?) "
+            "WHERE booking_id = ? AND status = 'approved'",
+            (datetime.now().isoformat(timespec="minutes"), booking_id),
         )

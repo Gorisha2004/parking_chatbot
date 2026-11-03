@@ -15,6 +15,7 @@ from parking_chatbot import config
 from parking_chatbot.admin.agent import AmbiguousReplyError, interpret_and_apply, render_request
 from parking_chatbot.db import admin as admin_db
 from parking_chatbot.db.schema import create_tables
+from parking_chatbot.recording.client import start_retry_sweep_thread
 
 
 @asynccontextmanager
@@ -24,7 +25,9 @@ async def lifespan(app: FastAPI):
     # server must do it itself on startup. Safe to run every time: it only adds
     # missing tables/columns, it never drops or overwrites existing data.
     create_tables()
+    stop_sweep = start_retry_sweep_thread()
     yield
+    stop_sweep.set()
 
 
 app = FastAPI(title="Parking Chatbot - Admin API", lifespan=lifespan)

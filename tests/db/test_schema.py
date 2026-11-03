@@ -57,7 +57,7 @@ def _reservation_columns() -> set[str]:
 
 
 def test_fresh_database_has_the_admin_decision_columns(sql_db):
-    assert {"escalated_at", "decided_at", "decision_reason"} <= _reservation_columns()
+    assert {"escalated_at", "decided_at", "decision_reason", "recorded_at"} <= _reservation_columns()
 
 
 def test_upgrades_a_pre_stage2_reservations_table_without_losing_data(sql_db):
@@ -78,13 +78,93 @@ def test_upgrades_a_pre_stage2_reservations_table_without_losing_data(sql_db):
 
     create_tables()
 
-    assert {"escalated_at", "decided_at", "decision_reason"} <= _reservation_columns()
+    assert {"escalated_at", "decided_at", "decision_reason", "recorded_at"} <= _reservation_columns()
     with closing(get_connection()) as conn:
         row = conn.execute(
-            "SELECT first_name, status, escalated_at, decided_at, decision_reason FROM reservations "
+            "SELECT first_name, status, escalated_at, decided_at, decision_reason, recorded_at FROM reservations "
             "WHERE booking_id = 'PK-OLD001'"
         ).fetchone()
-    assert row == ("Anna", "approved", None, None, None)
+    # escalated_at/decided_at/decision_reason are genuinely unknown for data from
+    # before those columns existed, so they stay NULL. recorded_at is different: it
+    # drives the Stage 3 retry sweep, so a pre-existing *approved* booking is
+    # backfilled as already-recorded instead - see test_schema.py's dedicated tests
+    # for that behavior below.
+    assert row[:5] == ("Anna", "approved", None, None, None)
+    assert row[5] is not None
+
+
+# --- recorded_at backfill: must fire exactly once, not on every create_tables() call --------------
+
+
+def test_adding_recorded_at_backfills_existing_approved_bookings_as_already_recorded(sql_db):
+    """recorded_at NULL is what queues a booking for the Stage 3 retry sweep. A
+    booking that was already approved before this column even existed predates
+    Stage 3 recording entirely, so it must not be queued as if it were new work."""
+    pre_stage3_layout = (
+        "CREATE TABLE reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT NOT NULL UNIQUE, "
+        "first_name TEXT NOT NULL, last_name TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "escalated_at TEXT, decided_at TEXT, decision_reason TEXT)"
+    )
+    with closing(get_connection()) as conn, conn:
+        conn.execute("DROP TABLE reservation_vehicles")
+        conn.execute("DROP TABLE reservations")
+        conn.execute(pre_stage3_layout)
+        conn.execute(
+            "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, status, decided_at) "
+            "VALUES ('PK-OLD001', 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', 'approved', '2026-11-18T10:00')"
+        )
+
+    create_tables()
+
+    with closing(get_connection()) as conn:
+        row = conn.execute("SELECT status, recorded_at FROM reservations WHERE booking_id = 'PK-OLD001'").fetchone()
+    assert row[0] == "approved"
+    assert row[1] is not None
+
+
+def test_adding_recorded_at_does_not_backfill_pending_or_refused_bookings(sql_db):
+    pre_stage3_layout = (
+        "CREATE TABLE reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT NOT NULL UNIQUE, "
+        "first_name TEXT NOT NULL, last_name TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "escalated_at TEXT, decided_at TEXT, decision_reason TEXT)"
+    )
+    with closing(get_connection()) as conn, conn:
+        conn.execute("DROP TABLE reservation_vehicles")
+        conn.execute("DROP TABLE reservations")
+        conn.execute(pre_stage3_layout)
+        for booking_id, status in (("PK-OLD001", "pending"), ("PK-OLD002", "refused")):
+            conn.execute(
+                "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, status) "
+                f"VALUES ('{booking_id}', 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', '{status}')"
+            )
+
+    create_tables()
+
+    with closing(get_connection()) as conn:
+        rows = conn.execute("SELECT recorded_at FROM reservations ORDER BY booking_id").fetchall()
+    assert rows == [(None,), (None,)]
+
+
+def test_create_tables_does_not_backfill_a_newly_approved_booking_on_a_later_call(sql_db):
+    """The one-time backfill above must never re-fire once recorded_at already
+    exists - otherwise every future approval would be silently marked "recorded"
+    the next time create_tables() runs (e.g. on the next process startup), without
+    it ever actually being sent to the recording server."""
+    with closing(get_connection()) as conn, conn:
+        conn.execute(
+            "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, status, decided_at) "
+            "VALUES ('PK-NEW001', 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', 'approved', '2026-11-18T10:00')"
+        )
+
+    create_tables()  # recorded_at already exists in this (fresh) database
+
+    with closing(get_connection()) as conn:
+        recorded_at = conn.execute(
+            "SELECT recorded_at FROM reservations WHERE booking_id = 'PK-NEW001'"
+        ).fetchone()[0]
+    assert recorded_at is None
 
 
 def test_upgrades_the_original_one_vehicle_per_row_layout(sql_db):

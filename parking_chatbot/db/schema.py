@@ -1,6 +1,7 @@
 """Database tables, and the one-off upgrade of databases created by older versions."""
 import sqlite3
 from contextlib import closing
+from datetime import datetime
 
 from parking_chatbot.db.database import get_connection, immediate_transaction
 from parking_chatbot.reservation.ids import new_booking_id, pass_id
@@ -74,21 +75,46 @@ def create_tables() -> None:
         if _has_legacy_reservations(conn):
             _migrate_legacy_reservations(conn)
         conn.executescript(SCHEMA_SQL)
-        _add_missing_columns(
-            conn, "reservations", {"escalated_at": "TEXT", "decided_at": "TEXT", "decision_reason": "TEXT"}
+        added = _add_missing_columns(
+            conn,
+            "reservations",
+            {"escalated_at": "TEXT", "decided_at": "TEXT", "decision_reason": "TEXT", "recorded_at": "TEXT"},
+        )
+        if "recorded_at" in added:
+            _backfill_recorded_at_for_pre_stage3_approvals(conn)
+
+
+def _backfill_recorded_at_for_pre_stage3_approvals(conn: sqlite3.Connection) -> None:
+    """The first time recorded_at is added, every already-approved booking predates
+    Stage 3 recording entirely - mark them as already recorded so the retry sweep
+    doesn't send old (possibly test) approvals to the recording server the moment
+    it starts running, instead of treating them as new work.
+
+    Only ever runs once per database, right after the column is created (see the
+    `"recorded_at" in added` check above) - never on an ordinary create_tables()
+    call against a database that already has the column, which would otherwise
+    silently mark every future approval "recorded" without it ever being sent.
+    """
+    with conn:
+        conn.execute(
+            "UPDATE reservations SET recorded_at = ? WHERE status = 'approved' AND recorded_at IS NULL",
+            (datetime.now().isoformat(timespec="minutes"),),
         )
 
 
-def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> set[str]:
     """Add any of these columns the table doesn't already have. Safe to run every time;
-    CREATE TABLE IF NOT EXISTS alone never adds columns to a table that already exists."""
+    CREATE TABLE IF NOT EXISTS alone never adds columns to a table that already exists.
+    Returns the names of the columns actually added this call (empty if the table
+    already had all of them) - callers use this to run one-time-only follow-up work."""
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     missing = {name: sql_type for name, sql_type in columns.items() if name not in existing}
     if not missing:
-        return
+        return set()
     with conn:
         for name, sql_type in missing.items():
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+    return set(missing)
 
 
 def _has_legacy_reservations(conn: sqlite3.Connection) -> bool:

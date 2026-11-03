@@ -169,6 +169,10 @@ def apply_decision(booking_id: str, decision: Literal["approved", "refused"], re
     except admin_db.AlreadyDecidedError as error:
         if error.status != decision:
             raise
+    if decision == "approved":
+        from parking_chatbot.recording.client import send_approved_booking
+
+        send_approved_booking(booking_id)  # best-effort; never raises, never blocks the approval
     return AdminDecision(booking_id=booking_id, decision=decision, reason=reason)
 
 

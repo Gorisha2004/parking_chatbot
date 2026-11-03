@@ -238,3 +238,113 @@ def test_two_simultaneous_decisions_on_the_same_booking_cannot_both_win(sql_db):
     assert sorted(o[0] for o in outcomes) == ["ok", "rejected"]
     final_status = admin.get_booking("PK-AAAAAA")["status"]
     assert final_status == next(d for outcome, d in outcomes if outcome == "ok")
+
+
+# --- list_unrecorded_approved_bookings / mark_recorded (Stage 3) -----------------------------------
+
+
+def test_list_unrecorded_approved_bookings_includes_an_approved_booking_with_no_recorded_at(sql_db):
+    _insert_booking("PK-AAAAAA", status="pending")
+    admin.record_decision("PK-AAAAAA", "approved", "looks fine")
+
+    [booking] = admin.list_unrecorded_approved_bookings()
+
+    assert booking.booking_id == "PK-AAAAAA"
+    assert (booking.first_name, booking.last_name) == ("Anna", "Smith")
+    assert booking.decided_at is not None
+
+
+@pytest.mark.parametrize("status", ["pending", "refused", "expired"])
+def test_list_unrecorded_approved_bookings_excludes_non_approved_statuses(sql_db, status):
+    _insert_booking("PK-AAAAAA", status=status)
+    assert admin.list_unrecorded_approved_bookings() == []
+
+
+def test_list_unrecorded_approved_bookings_excludes_an_already_recorded_booking(sql_db):
+    _insert_booking("PK-AAAAAA", status="pending")
+    admin.record_decision("PK-AAAAAA", "approved", None)
+    admin.mark_recorded("PK-AAAAAA")
+
+    assert admin.list_unrecorded_approved_bookings() == []
+
+
+def test_list_unrecorded_approved_bookings_includes_every_vehicle(sql_db):
+    _insert_booking("PK-AAAAAA", status="pending", vehicles=(("AAA111", "car"), ("BBB222", "van")))
+    admin.record_decision("PK-AAAAAA", "approved", None)
+
+    [booking] = admin.list_unrecorded_approved_bookings()
+
+    assert [(v.car_number, v.vehicle_type) for v in booking.vehicles] == [("AAA111", "car"), ("BBB222", "van")]
+
+
+def test_mark_recorded_removes_a_booking_from_the_unrecorded_list(sql_db):
+    _insert_booking("PK-AAAAAA", status="pending")
+    admin.record_decision("PK-AAAAAA", "approved", None)
+    assert len(admin.list_unrecorded_approved_bookings()) == 1
+
+    admin.mark_recorded("PK-AAAAAA")
+
+    assert admin.list_unrecorded_approved_bookings() == []
+
+
+def test_mark_recorded_is_idempotent_and_keeps_the_first_timestamp(sql_db):
+    _insert_booking("PK-AAAAAA", status="pending")
+    admin.record_decision("PK-AAAAAA", "approved", None)
+    admin.mark_recorded("PK-AAAAAA")
+    with closing(get_connection()) as conn:
+        first = conn.execute("SELECT recorded_at FROM reservations WHERE booking_id = 'PK-AAAAAA'").fetchone()[0]
+
+    admin.mark_recorded("PK-AAAAAA")  # e.g. the server reports "already recorded" on a retry
+
+    with closing(get_connection()) as conn:
+        second = conn.execute("SELECT recorded_at FROM reservations WHERE booking_id = 'PK-AAAAAA'").fetchone()[0]
+    assert second == first
+
+
+def test_list_unrecorded_approved_bookings_preserves_vehicle_order_not_alphabetical(sql_db):
+    _insert_booking(
+        "PK-AAAAAA", status="pending", vehicles=(("ZZZ999", "van"), ("AAA111", "car"), ("MMM555", "motorcycle"))
+    )
+    admin.record_decision("PK-AAAAAA", "approved", None)
+
+    [booking] = admin.list_unrecorded_approved_bookings()
+
+    assert [v.car_number for v in booking.vehicles] == ["ZZZ999", "AAA111", "MMM555"]
+
+
+@pytest.mark.parametrize("status", ["pending", "refused", "expired"])
+def test_mark_recorded_does_nothing_on_a_non_approved_booking(sql_db, status):
+    _insert_booking("PK-AAAAAA", status=status)
+
+    admin.mark_recorded("PK-AAAAAA")
+
+    with closing(get_connection()) as conn:
+        recorded_at = conn.execute("SELECT recorded_at FROM reservations WHERE booking_id = 'PK-AAAAAA'").fetchone()[
+            0
+        ]
+    assert recorded_at is None
+
+
+def test_two_concurrent_marks_recorded_are_safe(sql_db):
+    _insert_booking("PK-AAAAAA", status="pending")
+    admin.record_decision("PK-AAAAAA", "approved", None)
+    errors = []
+
+    def mark():
+        try:
+            admin.mark_recorded("PK-AAAAAA")
+        except Exception as error:  # the test only cares that neither call ever raises
+            errors.append(error)
+
+    threads = [threading.Thread(target=mark) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    with closing(get_connection()) as conn:
+        recorded_at = conn.execute("SELECT recorded_at FROM reservations WHERE booking_id = 'PK-AAAAAA'").fetchone()[
+            0
+        ]
+    assert recorded_at is not None

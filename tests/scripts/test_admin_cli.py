@@ -1,8 +1,10 @@
 import importlib.util
+from contextlib import closing
 
 import pytest
 
 from parking_chatbot import config
+from parking_chatbot.db.database import get_connection
 
 
 def _load_script(name):
@@ -94,6 +96,39 @@ def test_main_shows_tools_only_in_debug_mode(run_cli):
 def test_main_exits_cleanly_on_end_of_input(run_cli):
     out = run_cli([], lambda agent, msg, tid: ("unused", []))
     assert "Bye!" in out
+
+
+def test_main_migrates_a_pre_stage_3_database_on_startup(run_cli):
+    """A database created before Stage 3 has no recorded_at column at all - admin_cli
+    must add it (and backfill existing approved bookings as already-recorded) itself
+    on startup, the same way admin/server.py's lifespan does, since nothing else
+    calls create_tables() before the retry sweep thread starts using that column."""
+    pre_stage3_layout = (
+        "CREATE TABLE reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT NOT NULL UNIQUE, "
+        "first_name TEXT NOT NULL, last_name TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "escalated_at TEXT, decided_at TEXT, decision_reason TEXT)"
+    )
+    with closing(get_connection()) as conn, conn:
+        conn.execute(pre_stage3_layout)
+        conn.execute(
+            "CREATE TABLE reservation_vehicles (id INTEGER PRIMARY KEY AUTOINCREMENT, reservation_id INTEGER, "
+            "pass_id TEXT NOT NULL UNIQUE, car_number TEXT NOT NULL, vehicle_type TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO reservations (booking_id, first_name, last_name, start_time, end_time, status, decided_at) "
+            "VALUES ('PK-OLD001', 'Anna', 'Smith', '2026-11-20T09:00', '2026-11-20T12:00', 'approved', '2026-11-18T10:00')"
+        )
+
+    run_cli(["q"], lambda agent, msg, tid: pytest.fail("must not call the agent"))
+
+    with closing(get_connection()) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
+        recorded_at = conn.execute(
+            "SELECT recorded_at FROM reservations WHERE booking_id = 'PK-OLD001'"
+        ).fetchone()[0]
+    assert "recorded_at" in columns
+    assert recorded_at is not None  # backfilled: predates Stage 3, must not be re-sent
 
 
 def test_main_exits_cleanly_on_ctrl_c(monkeypatch, capsys):

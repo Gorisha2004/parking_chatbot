@@ -13,6 +13,8 @@ wheels/
 chroma_db/
 data/parking.db
 data/*.bak
+data/reservations.txt
+data/reservations.txt.lock
 
 project_overview.md
 
