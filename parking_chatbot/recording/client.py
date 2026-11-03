@@ -65,17 +65,47 @@ async def _call_record_reservation(booking: ApprovedBooking, timeout: float) -> 
     return body
 
 
+class RecordingError(RuntimeError):
+    """The recording server could not be reached, or did not confirm the write.
+
+    Raised only by record_approved_booking(). The best-effort hook below swallows
+    it; the Stage 4 orchestration layer catches it to route the booking down its
+    "recording failed" path and tell the user something concrete.
+    """
+
+
+def record_approved_booking(booking_id: str, timeout: float = HOOK_TIMEOUT_SECONDS) -> bool:
+    """Record one approved booking, and raise RecordingError if that fails.
+
+    The strict counterpart to send_approved_booking() below: same single attempt,
+    same write, but the failure is reported instead of logged and dropped, so a
+    caller that needs to know (a graph node deciding which message the user gets)
+    can tell the difference between "recorded" and "not recorded yet".
+
+    Returns True if this call recorded the booking, and False if there was nothing
+    left to record - an unknown booking, one that is not approved, or one already
+    recorded. All three are already-consistent states, not failures.
+    """
+    bookings = [b for b in admin_db.list_unrecorded_approved_bookings() if b.booking_id == booking_id]
+    if not bookings:
+        return False
+    try:
+        asyncio.run(_call_record_reservation(bookings[0], timeout))
+    except Exception as error:
+        raise RecordingError(
+            f"Could not record booking {booking_id} ({type(error).__name__}: {error})"
+        ) from error
+    admin_db.mark_recorded(booking_id)
+    return True
+
+
 def send_approved_booking(booking_id: str, timeout: float = HOOK_TIMEOUT_SECONDS) -> None:
     """Best-effort: called right after an approval is written. Never raises -
     failure here just leaves recorded_at empty, and retry_unrecorded() (run on the
     next admin action and on an interval) picks it up later. No backoff here by
     design: this is a single, short, one-shot attempt, not a retry loop."""
     try:
-        bookings = [b for b in admin_db.list_unrecorded_approved_bookings() if b.booking_id == booking_id]
-        if not bookings:
-            return
-        asyncio.run(_call_record_reservation(bookings[0], timeout))
-        admin_db.mark_recorded(booking_id)
+        record_approved_booking(booking_id, timeout)
     except Exception:
         logger.warning("Could not record booking %s with the recording server yet", booking_id)
 

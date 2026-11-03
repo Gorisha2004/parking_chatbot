@@ -88,3 +88,19 @@ if MCP_REQUEST_TIMEOUT_SECONDS < 1:
 # .resolve() turns it into a full absolute path.
 # .parent goes one folder up. Doing it twice goes from config.py → parting_chatbot/ → the project root.
 # / "data" / "static" joins path parts (yes, / is overloaded in Path to mean “join”).
+
+# --- Stage 4: LangGraph orchestration of the whole pipeline -----------------------------------
+
+# Which LangGraph checkpointer the workflow uses to persist its shared state.
+# "sqlite" (the default) keeps a pending approval across process restarts, which is
+# the point of checkpointing here; "memory" keeps it only for the life of the
+# process and is what the test suite and the load harness use, so neither leaves a
+# file behind. Anything else is a configuration error, not a silent fallback.
+WORKFLOW_CHECKPOINT_BACKEND = os.getenv("WORKFLOW_CHECKPOINT_BACKEND", "sqlite").strip().lower()
+if WORKFLOW_CHECKPOINT_BACKEND not in ("sqlite", "memory"):
+    raise ValueError('WORKFLOW_CHECKPOINT_BACKEND must be either "sqlite" or "memory".')
+# Where the sqlite checkpointer stores workflow state. Resolved against the project
+# root like MCP_RESERVATIONS_FILE_PATH, so it does not depend on the current directory.
+WORKFLOW_CHECKPOINT_DB_PATH = (
+    PROJECT_ROOT / os.getenv("WORKFLOW_CHECKPOINT_DB_PATH", "data/workflow_checkpoints.sqlite")
+).resolve()

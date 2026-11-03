@@ -451,3 +451,38 @@ def test_another_conversation_cannot_see_a_booking_even_with_its_ids(cfg, capaci
     for output in outputs:
         for value in leaked_values:
             assert value.upper() not in output.upper()
+
+
+# --- the read-only accessors the Stage 4 workflow uses ----------------------------------------
+
+
+def test_get_draft_returns_the_draft_being_collected_and_none_otherwise(cfg, capacity):
+    tid = cfg["configurable"]["thread_id"]
+    assert rt.get_draft(tid) is None
+    _call(rt.update_reservation_details, {"first_name": "Anna"}, cfg)
+    draft = rt.get_draft(tid)
+    assert draft is not None and draft.first_name == "Anna"
+
+
+def test_get_draft_cannot_see_another_conversations_draft(cfg, capacity):
+    _call(rt.update_reservation_details, {"first_name": "Anna"}, cfg)
+    other = _new_cfg()
+    assert rt.get_draft(other["configurable"]["thread_id"]) is None
+
+
+def test_summary_was_shown_tracks_the_confirmation_step(cfg, capacity):
+    tid = cfg["configurable"]["thread_id"]
+    assert rt.summary_was_shown(tid) is False
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    assert rt.summary_was_shown(tid) is True
+
+
+def test_last_submitted_booking_id_reports_the_booking_just_submitted(cfg, capacity):
+    tid = cfg["configurable"]["thread_id"]
+    assert rt.last_submitted_booking_id(tid) is None
+    _fill(cfg)
+    _call(rt.show_reservation_summary, {}, cfg)
+    with patch.object(rt, "get_admin_channel", lambda: FakeAdminChannel()):
+        submitted = _call(rt.submit_reservation, {}, cfg)
+    assert rt.last_submitted_booking_id(tid) == submitted["booking_id"]

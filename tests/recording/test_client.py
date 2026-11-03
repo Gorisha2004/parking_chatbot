@@ -161,3 +161,42 @@ def test_start_retry_sweep_thread_survives_a_failing_sweep(sql_db, monkeypatch):
 
     time.sleep(0.2)
     stop_event.set()
+
+
+# --- the strict counterpart the Stage 4 record node uses --------------------------------------
+
+
+def test_record_approved_booking_records_and_reports_success(sql_db, monkeypatch):
+    _insert_approved("PK-AAAAAA")
+    monkeypatch.setattr(client, "_call_record_reservation", _ok)
+
+    assert client.record_approved_booking("PK-AAAAAA") is True
+    assert admin_db.list_unrecorded_approved_bookings() == []
+
+
+def test_record_approved_booking_raises_a_recording_error_on_failure(sql_db, monkeypatch):
+    _insert_approved("PK-AAAAAA")
+    monkeypatch.setattr(client, "_call_record_reservation", _boom)
+
+    with pytest.raises(client.RecordingError) as error:
+        client.record_approved_booking("PK-AAAAAA")
+    assert "PK-AAAAAA" in str(error.value)
+    # The booking is left unrecorded, so the retry sweep still picks it up.
+    assert [b.booking_id for b in admin_db.list_unrecorded_approved_bookings()] == ["PK-AAAAAA"]
+
+
+def test_record_approved_booking_returns_false_when_there_is_nothing_left_to_record(sql_db, monkeypatch):
+    def must_not_be_called(booking, timeout):
+        raise AssertionError("the server must not be called for an already-recorded booking")
+
+    monkeypatch.setattr(client, "_call_record_reservation", must_not_be_called)
+    assert client.record_approved_booking("PK-NOPE00") is False
+
+
+def test_send_approved_booking_still_swallows_a_recording_error(sql_db, monkeypatch):
+    """The best-effort hook keeps its contract: it delegates, but never raises."""
+    _insert_approved("PK-AAAAAA")
+    monkeypatch.setattr(client, "_call_record_reservation", _boom)
+
+    client.send_approved_booking("PK-AAAAAA")  # must not raise
+    assert [b.booking_id for b in admin_db.list_unrecorded_approved_bookings()] == ["PK-AAAAAA"]

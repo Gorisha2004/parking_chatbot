@@ -278,6 +278,33 @@ def check_booking_status(config: RunnableConfig, booking_id: str | None = None) 
     )
 
 
+def get_draft(thread_id: str) -> ReservationDraft | None:
+    """The reservation currently being collected in this conversation, or None.
+
+    A read-only accessor, not an agent tool: the LangGraph orchestration layer
+    (Stage 4) mirrors the draft into its typed shared state so the workflow can
+    see what has been collected without reaching into this module's internals or
+    re-implementing any of the collection logic that lives in the tools above.
+    """
+    return _drafts.get(thread_id)
+
+
+def summary_was_shown(thread_id: str) -> bool:
+    """Whether the user has already been shown a summary to confirm. Read-only
+    accessor for the orchestration layer, for the same reason as get_draft()."""
+    return thread_id in _summary_shown
+
+
+def last_submitted_booking_id(thread_id: str) -> str | None:
+    """The last booking ID this conversation submitted or looked up, or None.
+
+    Read-only accessor for the orchestration layer: submit_reservation returns
+    the new booking ID only inside the tool message the LLM sees, so this is how
+    a graph node learns which booking a turn just created.
+    """
+    return _last_booking_id.get(thread_id)
+
+
 def pending_decisions(thread_id: str) -> list[dict]:
     """Bookings submitted in this conversation that have just been decided (no longer
     pending). Not an agent tool - called by the CLI's background notifier, not the LLM.
